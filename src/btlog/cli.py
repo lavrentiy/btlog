@@ -1,4 +1,4 @@
-"""btlog: a bluesitting daemon. It sits at home all day and night, logs the
+"""btlog: a bluesitting daemon. It sits in situ all day and night, logs the
 Bluetooth LE devices in proximity, and answers questions about the trends.
 
   btlog devices [--since 7d]       devices heard, newest sighting first (--private adds rotating ones)

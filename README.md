@@ -1,7 +1,7 @@
 # btlog
 
 A bluesitting daemon. Wardriving goes out to find Bluetooth devices; btlog stays
-at home, day and night, and notes which Bluetooth LE devices come by, when, and
+in situ, day and night, and notes which Bluetooth LE devices come by, when, and
 how strongly. Then it answers the trend questions: who is around at which hours
 and on which days, who is new this week, who is here the most, and whether a
 device is drifting closer or further away.
