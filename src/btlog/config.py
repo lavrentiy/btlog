@@ -23,7 +23,7 @@ class Config:
     db: Path = field(default_factory=_default_db)
     interval: float = 60.0        # seconds per scan cycle: one sighting per device per cycle
     adapter: str | None = None    # "hci0"; None picks the default adapter
-    retention_days: int = 90      # raw sightings; 0 keeps them forever (rollups always are)
+    retention_days: int = 90      # raw sightings and readings; 0 keeps them forever (rollups always are)
     forget_random_days: int = 7   # private random addresses unseen this long are removed; 0 never
     web_bind: str = "127.0.0.1:8778"
     web_names: list = field(default_factory=list)  # extra Host names for the dashboard, e.g. Tailscale's

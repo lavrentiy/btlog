@@ -22,8 +22,9 @@ database and the same config file. Python 3.11+, one dependency
 | **Forgets rotating addresses** | Phones and watches change their random address every few minutes. Such an address unseen for `forget_random_days` (7) is removed; only its contribution to "how many devices per hour" is kept, under one anonymous pseudo-device. |
 | **Keeps raw data a while** | Raw sightings are kept `retention_days` (90) for CSV export and debugging. Hourly rollups are tiny and kept forever. |
 | **Names things** | A device without a name is still shown by vendor (Apple, Garmin, Samsung...) from its manufacturer data, and you can label any device (`btlog name`). |
-| **CLI** | `devices`, `show`, `hours`, `days`, `heat`, `rssi`, `new`, `top`, `name`, `export`, `status`; bars in a terminal, `--json` for scripts. |
-| **Web** | `btlog web`: devices, presence by hour and weekday, a day-by-hour heatmap, signal per day, new devices on one page, standard library only. |
+| **Reads sensors** | Thermometers and the like that put their readings in their advertisements (BTHome, Ruuvi, Xiaomi on custom firmware) are decoded as they are heard: temperature, humidity, battery and more, with the same hourly rollups. See [Sensors](#sensors). |
+| **CLI** | `devices`, `show`, `hours`, `days`, `heat`, `rssi`, `readings`, `now`, `new`, `top`, `name`, `export`, `status`; bars in a terminal, `--json` for scripts. |
+| **Web** | `btlog web`: devices, presence by hour and weekday, a day-by-hour heatmap, signal and sensor readings per day, new devices on one page, standard library only. |
 
 ## Command line
 
@@ -36,6 +37,8 @@ btlog hours                            # how many devices are around at each hou
 btlog days "my watch" --since 90d
 btlog heat "my watch" --since 14d      # presence calendar: one row per day, one cell per hour
 btlog rssi "my watch" --by hour        # signal strength over time (max / average dBm)
+btlog readings garden --kind temperature --by hour   # sensor readings: min / average / max
+btlog now                              # the last scan cycle: who is here, and the latest readings
 btlog new --since 1d                   # devices seen for the first time since yesterday
 btlog top --since 7d                   # devices around the most
 btlog forget "neighbour's tv"          # remove one device and everything recorded about it
@@ -82,6 +85,36 @@ minutes (one phone leaves about a hundred a day), so they are hidden from
 `devices` unless asked for and are the ones that get forgotten; `unknown` is what a backend that does not report the
 address type gives (bleak on Windows), and is kept like `public`.
 
+## Sensors
+
+Many BLE sensors broadcast their readings in every advertisement, so btlog
+reads them without connecting or pairing. It decodes:
+
+- **BTHome v2**, unencrypted (Shelly BLU H&T and many DIY sensors);
+- **Ruuvi** RuuviTag, data format 5;
+- **Xiaomi LYWSD03MMC** and kin, but only with the
+  [pvvx](https://github.com/pvvx/ATC_MiThermometer) or atc1441 custom
+  firmware: the stock firmware encrypts its readings.
+
+Encrypted formats (encrypted BTHome, Victron Instant Readout) are left out,
+as they need AES, which the standard library does not have. Nothing needs
+configuring: a sensor in range simply gets readings next to its sightings.
+
+```
+$ btlog readings garden --kind temperature --since 2026-10-19
+readings of 38:39:8F:00:00:01 garden by day since 2026-10-19 (min / average / max)
+2026-10-19  temperature  █████████▅               6.05 /   11.41 /   16.86 °C
+2026-10-20  temperature  ██████████▁              6.25 /   11.69 /   17.21 °C
+2026-10-21  temperature  █████                    6.54 /    8.81 /   13.75 °C
+```
+
+Each cycle stores the last value of each kind a sensor sent. Those raw
+readings follow `retention_days` like sightings; the hourly rollup (count,
+min, max and sum per kind) is kept forever like presence, so `btlog readings`
+and the dashboard give the same answer after the raw rows are gone. `btlog
+now` shows each sensor's latest reading with its age, since a sensor need not
+advertise in every cycle.
+
 ## Web dashboard
 
 ```bash
@@ -91,9 +124,11 @@ btlog web --bind 0.0.0.0:8778      # reachable from the network
 
 One dark page, no frameworks: the devices on the left; for the selected device
 (or all of them) presence by hour of day and by weekday, a day-by-hour heatmap,
-signal strength per day, and the new devices of the last week. The same data is
-served as JSON under `/api/` (`status`, `devices`, `hours`, `days`, `timeline`,
-`rssi`, `new`, each taking `since`, `until` and `device` where it makes sense).
+signal strength per day, a chart per reading for a sensor, and the new devices
+of the last week. The same data is served as JSON under `/api/` (`status`,
+`devices`, `hours`, `days`, `timeline`, `rssi`, `readings`, `now`, `new`, each
+taking `since`, `until` and `device` where it makes sense; `readings` also
+takes `kind` and `by=day|hour`).
 
 The dashboard opens the database read-only and never writes. Device names come
 from strangers' advertisements, so the page escapes everything before it goes
@@ -130,9 +165,13 @@ SQLite, WAL mode so the CLI and the dashboard read while the daemon writes.
 | `sightings` | device and scan cycle: strongest RSSI, advertisements heard | `retention_days` |
 | `hourly` | device and local hour: cycles heard, best and summed RSSI | forever |
 | `cycles` | local hour: scan cycles the daemon ran | forever |
+| `readings` | sensor, kind and scan cycle: the value heard | `retention_days` |
+| `hourly_readings` | sensor, kind and local hour: count, min, max and sum | forever |
 
 Hours are local time, because "who is here at eight in the morning" is a local
-question. Privacy: the database is readable by the `btlog` user only
+question. `PRAGMA user_version` is the schema version (2 since readings); the
+daemon migrates the file when it starts, and a dashboard or CLI that meets an
+older file shows no readings until then. Privacy: the database is readable by the `btlog` user only
 (`/var/lib/btlog`, mode 0750); `forget_random_days` bounds how long a rotating
 address is kept; `btlog forget` removes one device, `btlog export` takes data
 out, and deleting the database file starts over. Advertised names are stored
@@ -209,6 +248,7 @@ nix develop                                   # or any Python 3.11+ with bleak
 PYTHONPATH=src python -m unittest discover -s tests -v
 PYTHONPATH=src python tools/demo.py demo.db   # ten days of made-up sightings, no adapter needed
 PYTHONPATH=src python -m btlog --db demo.db heat "my watch"
+PYTHONPATH=src python -m btlog --db demo.db readings garden
 PYTHONPATH=src python -m btlog --db demo.db web
 nix build                                     # builds and runs the tests
 ```

@@ -1,5 +1,5 @@
-"""The trend queries behind `btlog hours`, `days`, `heat`, `rssi`, `new`, `top`
-and the dashboard. All of them read the hourly rollups, never the raw
+"""The trend queries behind `btlog hours`, `days`, `heat`, `rssi`, `readings`,
+`new`, `top` and the dashboard. All of them read the hourly rollups, never the raw
 sightings, so they give the same answer before and after the raw rows are
 purged, and all of them cut at the hours `since` and `until` fall in.
 
@@ -9,6 +9,7 @@ same hours. For one device that is the fraction of cycles that heard it: 0.9 at
 number of devices heard per cycle. None marks a slot the scanner never covered.
 """
 
+from btlog.decoders import UNITS
 from btlog.store import between
 
 WEEKDAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
@@ -67,6 +68,25 @@ def rssi(store, device_id, since=None, until=None, by="day"):
         f"""SELECT day AS "when", MAX(rssi_max) AS max, SUM(rssi_sum) * 1.0 / SUM(cycles) AS avg
             FROM hourly WHERE device_id = ? AND {cond} GROUP BY day ORDER BY day""",
         (device_id, *args)).fetchall()
+
+
+def readings(store, device_id, kind=None, since=None, until=None, by="day"):
+    """Sensor readings over time: [{"when", "kind", "min", "avg", "max", "unit"}]
+    per local day or hour, one kind after the other, so each kind reads as its
+    own series. The average is over the cycles that heard a reading, not over
+    the clock: a sensor heard twice in an hour is averaged over those two."""
+    if by not in ("day", "hour"):
+        raise ValueError("by must be 'day' or 'hour'")
+    if not store.has_readings:
+        return []
+    cond, args = between(since, until)
+    slot = "day || ' ' || printf('%02d', hour)" if by == "hour" else "day"
+    rows = store.conn.execute(
+        f"""SELECT {slot} AS "when", kind, MIN(min) AS min, SUM(sum) / SUM(n) AS avg, MAX(max) AS max
+            FROM hourly_readings WHERE device_id = ? AND (? IS NULL OR kind = ?) AND {cond}
+            GROUP BY kind, "when" ORDER BY kind, "when" """,
+        (device_id, kind, kind, *args)).fetchall()
+    return [r | {"unit": UNITS.get(r["kind"], "")} for r in rows]
 
 
 def new(store, since, until=None):

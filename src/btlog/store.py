@@ -8,6 +8,11 @@
   cycles     per local hour: how many scan cycles the daemon ran. Presence is a
              fraction of that rather than of the wall clock, so a day the scanner
              was off does not read as a day nobody was home.
+  readings   one row per sensor per kind (temperature, humidity...) per cycle it
+             was heard in, decoded from its advertisements. Deleted with the
+             sightings after retention_days.
+  hourly_readings  per sensor per kind per local hour: count, min, max and sum,
+             kept forever like hourly.
 
 Hours are local time, because "who is here at eight in the morning" is a local
 question; day and weekday are stored alongside so GROUP BY stays in SQL.
@@ -17,6 +22,11 @@ minutes by design. One that has not been seen for forget_random_days is a dead
 end for trends and only a privacy liability, so purge() removes it; its hourly
 rows are folded into a single "forgotten" pseudo-device first, so the count of
 devices around per hour stays right after the address is gone.
+
+PRAGMA user_version says which tables exist: 1 (or 0, never set) is the schema
+without readings, 2 adds them. A writable Store migrates forward on open; a
+read-only one on an older file (the dashboard upgraded before the daemon was
+restarted) answers the reading queries with nothing rather than failing.
 """
 
 import os
@@ -24,7 +34,7 @@ import sqlite3
 from datetime import datetime
 from pathlib import Path
 
-from btlog import vendors
+from btlog import decoders, vendors
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS devices (
@@ -65,7 +75,27 @@ CREATE TABLE IF NOT EXISTS cycles (
     last_ts REAL NOT NULL,          -- start of the latest cycle in this hour
     PRIMARY KEY (day, hour)
 ) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS readings (
+    ts REAL NOT NULL,
+    device_id INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+    kind TEXT NOT NULL,             -- temperature, humidity, battery... (decoders.UNITS)
+    value REAL NOT NULL,            -- the last one heard in the cycle
+    PRIMARY KEY (device_id, kind, ts)
+) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS hourly_readings (
+    device_id INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+    day TEXT NOT NULL,
+    hour INTEGER NOT NULL,
+    weekday INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    n INTEGER NOT NULL,             -- cycles with a reading of this kind
+    min REAL NOT NULL,
+    max REAL NOT NULL,
+    sum REAL NOT NULL,
+    PRIMARY KEY (device_id, kind, day, hour)
+) WITHOUT ROWID;
 """
+VERSION = 2   # PRAGMA user_version of SCHEMA; see the module docstring
 
 PRIVATE_KINDS = ("rpa", "nrpa")
 FORGOTTEN = "forgotten"
@@ -159,6 +189,12 @@ class Store:
             # WAL lets the CLI and the dashboard read while the daemon writes.
             self.conn.execute("PRAGMA journal_mode=WAL")
             self.conn.executescript(SCHEMA)
+            if self.conn.execute("PRAGMA user_version").fetchone()[0] < VERSION:
+                self.conn.execute(f"PRAGMA user_version = {VERSION}")
+        # Read once: a reader lives for one command or one request, and the
+        # tables it may query do not change under it.
+        version = self.conn.execute("PRAGMA user_version").fetchone()[0]
+        self.has_readings = version >= 2
         self.conn.row_factory = _row
         self.conn.execute("PRAGMA foreign_keys=ON")
         self.conn.create_function("fold", 1, _fold, deterministic=True)
@@ -177,18 +213,20 @@ class Store:
     def record_cycle(self, ts, adverts):
         """Store one scan cycle started at ts: one sighting per address with the
         strongest RSSI, and the hourly rollups and cycle count advanced, so the
-        trends are always current and never need recomputing. Returns the number
-        of devices heard."""
+        trends are always current and never need recomputing. A sensor gets one
+        reading per kind, the last value heard in the cycle, rolled up the same
+        way. Returns the number of devices heard."""
         heard = {}
         for a in adverts:
             h = heard.get(a.address)
             if h is None:
-                h = heard[a.address] = {"rssi": a.rssi, "n": 0, "name": None, "mfr": None,
+                h = heard[a.address] = {"rssi": a.rssi, "n": 0, "name": None, "mfr": None, "readings": {},
                                         "kind": address_kind(a.address, a.address_type)}
             h["n"] += 1
             h["rssi"] = max(h["rssi"], a.rssi)
             h["name"] = printable(a.name) or h["name"]
             h["mfr"] = a.manufacturer if a.manufacturer is not None else h["mfr"]
+            h["readings"].update(decoders.decode(a.manufacturer_data, a.service_data))
         day, hour, weekday = local_hour(ts)
         with self.conn:
             self.conn.execute(
@@ -216,6 +254,14 @@ class Store:
                            cycles = cycles + 1, rssi_max = max(rssi_max, excluded.rssi_max),
                            rssi_sum = rssi_sum + excluded.rssi_sum""",
                     (day, hour, weekday, did, h["rssi"], h["rssi"]))
+                for kind, value in h["readings"].items():
+                    self.conn.execute("INSERT OR REPLACE INTO readings VALUES (?, ?, ?, ?)", (ts, did, kind, value))
+                    self.conn.execute(
+                        """INSERT INTO hourly_readings VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)
+                           ON CONFLICT(device_id, kind, day, hour) DO UPDATE SET
+                               n = n + 1, min = min(min, excluded.min), max = max(max, excluded.max),
+                               sum = sum + excluded.sum""",
+                        (did, day, hour, weekday, kind, value, value, value))
         return len(heard)
 
     def set_label(self, address, label):
@@ -237,13 +283,16 @@ class Store:
 
     def purge(self, now, retention_days, forget_random_days):
         """Apply retention; returns (sightings deleted, random devices forgotten).
-        0 for either means keep forever: that is the "log everything" setting,
-        so it must be an explicit no-op rather than "older than now"."""
+        Raw readings go with the sightings of the same age. 0 for either means
+        keep forever: that is the "log everything" setting, so it must be an
+        explicit no-op rather than "older than now". A forgotten address takes
+        its readings along: folded together, strangers' readings mean nothing."""
         # -1 as the cutoff matches nothing: timestamps are never negative here.
         old = now - retention_days * 86400 if retention_days else -1
         unseen = now - forget_random_days * 86400 if forget_random_days else -1
         with self.conn:
             sightings = self.conn.execute("DELETE FROM sightings WHERE ts < ?", (old,)).rowcount
+            self.conn.execute("DELETE FROM readings WHERE ts < ?", (old,))
             stale = ("kind IN (?, ?) AND last_seen < ?", (*PRIVATE_KINDS, unseen))
             if self.conn.execute(f"SELECT 1 FROM devices WHERE {stale[0]} LIMIT 1", stale[1]).fetchone():
                 self.conn.execute(
@@ -336,6 +385,26 @@ class Store:
             f"""SELECT s.ts, d.address, d.kind, d.name, d.label, s.rssi, s.adverts
                 FROM sightings s JOIN devices d ON d.id = s.device_id
                 WHERE {' AND '.join(where)} ORDER BY s.ts, d.address""", args)
+
+    def now(self):
+        """The latest scan cycle: when it ran and the devices it heard, strongest
+        first; and the latest reading of each kind from every sensor, with its
+        time. That one is from any cycle, not just the last: a sensor may
+        advertise less often than the scanner listens."""
+        last = self.conn.execute("SELECT MAX(last_ts) AS ts FROM cycles").fetchone()["ts"]
+        heard = self.conn.execute(
+            """SELECT d.*, s.rssi, s.adverts FROM sightings s JOIN devices d ON d.id = s.device_id
+               WHERE s.ts = ? ORDER BY s.rssi DESC, d.address""", (last,)).fetchall()
+        latest = []
+        if self.has_readings:
+            # SQLite fills the bare column value from the row MAX(ts) picked.
+            latest = self.conn.execute(
+                """SELECT d.address, d.name, d.label, d.manufacturer, r.kind, r.value, r.ts
+                   FROM (SELECT device_id, kind, value, MAX(ts) AS ts FROM readings GROUP BY device_id, kind) r
+                   JOIN devices d ON d.id = r.device_id
+                   ORDER BY fold(COALESCE(d.label, d.name, d.address)), d.address, r.kind""").fetchall()
+        return {"last_cycle": last, "devices": [public(d) for d in heard],
+                "readings": [public(r) | {"unit": decoders.UNITS.get(r["kind"], "")} for r in latest]}
 
     def status(self, sightings=True):
         """Counts and the last cycle, for `btlog status` and the dashboard header."""

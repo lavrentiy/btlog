@@ -9,7 +9,7 @@ from pathlib import Path
 
 from btlog import cli, config, when
 from btlog.store import Store
-from helpers import BEACON, PHONE, WATCH, adverts, at, fill_day
+from helpers import BEACON, PHONE, SENSOR, WATCH, adverts, at, bthome, fill_day, thermometer
 
 
 class CliTest(unittest.TestCase):
@@ -181,6 +181,50 @@ class CliTest(unittest.TestCase):
         _, out, _ = self.run_cli("--json", "show", "DE:AD:BE:EF:00:02", db=db)
         self.assertEqual(json.loads(out)["name"], "evil[2Jname")
 
+    def test_readings(self):
+        db = self.other_db((at(19, 8), [thermometer(18.0), bthome(SENSOR, "400161")]), (at(19, 14), [thermometer(24.0)]),
+                           (at(20, 8), [thermometer(20.0)]), (at(20, 9), adverts((WATCH, -60))))
+        code, out, err = self.run_cli("readings", "garden", "--since", "all", db=db)
+        self.assertEqual((code, err), (0, ""))
+        # Each kind's bar runs from its lowest to its highest value shown; a
+        # kind with a single value gets a full bar.
+        self.assertEqual(out.splitlines(), [
+            f"readings of {SENSOR} garden by day since all (min / average / max)",
+            "2026-10-19  battery      " + "█" * 20 + "    97.00 /   97.00 /   97.00 %",
+            "2026-10-19  temperature  " + "█" * 10 + " " * 10 + "    18.00 /   21.00 /   24.00 °C",
+            "2026-10-20  temperature  ██████▅" + " " * 13 + "    20.00 /   20.00 /   20.00 °C"])
+        _, out, _ = self.run_cli("--json", "readings", SENSOR, "--kind", "temperature", "--by", "hour", "--since", "2026-10-19T12:00", db=db)
+        self.assertEqual(json.loads(out), [
+            {"when": "2026-10-19 14", "kind": "temperature", "min": 24.0, "avg": 24.0, "max": 24.0, "unit": "°C"},
+            {"when": "2026-10-20 08", "kind": "temperature", "min": 20.0, "avg": 20.0, "max": 20.0, "unit": "°C"}])
+        _, out, _ = self.run_cli("readings", WATCH, db=db)
+        self.assertEqual(out.splitlines()[1], "no readings in this period")
+
+    def test_now(self):
+        db = self.other_db((at(21, 8), [thermometer(19.5), *adverts((WATCH, -60))]),
+                           (at(21, 8, 1), adverts((WATCH, -50, "evil\x1b[2J\nname"), (BEACON, -70))))
+        code, out, err = self.run_cli("now", db=db)
+        self.assertEqual((code, err), (0, ""))
+        lines = out.splitlines()
+        self.assertEqual(lines[:4], ["last scan cycle 2026-10-21 08:01:00, 2 devices heard",
+                                     "ADDRESS            KIND    LABEL/NAME   RSSI",
+                                     f"{WATCH}  static  evil[2Jname  -50",
+                                     f"{BEACON}  public               -70"])
+        self.assertNotIn("\x1b", out)   # a hostile name was stripped when it was stored
+        self.assertEqual(lines[5].split(), ["SENSOR", "KIND", "VALUE", "HEARD"])
+        self.assertRegex(lines[6], r"^garden  temperature  19\.5 °C  \d+[smhd] ago$")
+        _, out, _ = self.run_cli("--json", "now", db=db)
+        data = json.loads(out)
+        self.assertEqual(data["last_cycle"], at(21, 8, 1))
+        self.assertEqual([(d["address"], d["name"], d["rssi"]) for d in data["devices"]],
+                         [(WATCH, "evil[2Jname", -50), (BEACON, None, -70)])
+        self.assertEqual([(r["address"], r["kind"], r["value"], r["unit"], r["ts"]) for r in data["readings"]],
+                         [(SENSOR, "temperature", 19.5, "°C", at(21, 8))])
+        empty = Path(self.tmp.name) / "empty.db"
+        Store(empty).close()
+        _, out, _ = self.run_cli("now", db=empty)
+        self.assertEqual(out, "last scan cycle -, 0 devices heard\nADDRESS  KIND  LABEL/NAME  RSSI\n")
+
     def test_status_and_purge(self):
         _, out, _ = self.run_cli("--json", "status")
         s = json.loads(out)
@@ -246,6 +290,8 @@ class WhenTest(unittest.TestCase):
         self.assertIsNone(when.parse("all", now))
         self.assertEqual(when.fmt(now), "2026-10-19 10:30")
         self.assertEqual(when.fmt(None), "-")
+        self.assertEqual([when.ago(now - s, now) for s in (5, 59, 60, 7199, 86400 * 3)], ["5s", "59s", "1m", "1h", "3d"])
+        self.assertEqual((when.ago(now + 5, now), when.ago(None)), ("0s", "-"))
         with self.assertRaises(ValueError):
             when.parse("soon", now)
 

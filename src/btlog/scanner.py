@@ -10,7 +10,7 @@ only when the real source is built, so nothing else needs it installed.
 import asyncio
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 log = logging.getLogger("btlog")
 
@@ -21,7 +21,9 @@ class Advert:
     rssi: int
     address_type: str | None = None   # "public" or "random" when the backend says
     name: str | None = None
-    manufacturer: int | None = None   # Bluetooth SIG company id
+    manufacturer: int | None = None   # Bluetooth SIG company id, the lowest one: names the vendor
+    manufacturer_data: dict = field(default_factory=dict)  # company id -> bytes
+    service_data: dict = field(default_factory=dict)       # service UUID -> bytes
 
 
 def advert_from(device, adv):
@@ -31,7 +33,8 @@ def advert_from(device, adv):
     (a paired keyboard connecting, say), and those carry no RSSI; bleak fills
     in -127. Such a report is not a sighting and is dropped. The lowest company
     id is taken when a device carries several, so the vendor does not flip
-    from cycle to cycle with dictionary order.
+    from cycle to cycle with dictionary order. The payloads are copied as
+    bytes, so a frozen Advert holds immutable values whatever the backend gave.
     """
     details = getattr(device, "details", None)
     props = details.get("props", {}) if isinstance(details, dict) else {}
@@ -40,7 +43,9 @@ def advert_from(device, adv):
     return Advert(
         address=device.address.upper(), rssi=adv.rssi,
         address_type=props.get("AddressType"), name=adv.local_name,
-        manufacturer=min(adv.manufacturer_data) if adv.manufacturer_data else None)
+        manufacturer=min(adv.manufacturer_data) if adv.manufacturer_data else None,
+        manufacturer_data={k: bytes(v) for k, v in adv.manufacturer_data.items()},
+        service_data={k: bytes(v) for k, v in adv.service_data.items()})
 
 
 class BleakSource:

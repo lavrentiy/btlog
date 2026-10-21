@@ -23,7 +23,7 @@ class FakeScanner:
 
     async def __aenter__(self):
         dev = NS(address="c0:aa:bb:cc:dd:ee", details={"path": "x", "props": {"AddressType": "random", "RSSI": -55}})
-        self.callback(dev, NS(rssi=-55, local_name="Watch", manufacturer_data={}, service_uuids=[]))
+        self.callback(dev, NS(rssi=-55, local_name="Watch", manufacturer_data={}, service_data={}, service_uuids=[]))
         return self
 
     async def __aexit__(self, *exc):
@@ -56,16 +56,28 @@ class BleakSourceTest(unittest.TestCase):
 
 class AdvertFromTest(unittest.TestCase):
     """What bleak hands over, as fakes: BLEDevice(address, details) and
-    AdvertisementData(rssi, local_name, manufacturer_data, service_uuids)."""
+    AdvertisementData(rssi, local_name, manufacturer_data, service_data, service_uuids)."""
 
-    def adv(self, rssi=-60, name="Watch", mfr=None, uuids=()):
-        return NS(rssi=rssi, local_name=name, manufacturer_data=mfr or {}, service_uuids=list(uuids))
+    def adv(self, rssi=-60, name="Watch", mfr=None, uuids=(), service=None):
+        return NS(rssi=rssi, local_name=name, manufacturer_data=mfr or {}, service_data=service or {},
+                  service_uuids=list(uuids))
 
     def test_bluez_device(self):
         dev = NS(address="c0:aa:bb:cc:dd:ee", details={"path": "/org/bluez/hci0/dev_C0", "props": {"AddressType": "random", "RSSI": -60}})
         a = advert_from(dev, self.adv(mfr={0x004C: b"\x01", 0x0006: b"\x02"}, uuids=["180d"]))
         self.assertEqual((a.address, a.rssi, a.address_type, a.name, a.manufacturer),
                          ("C0:AA:BB:CC:DD:EE", -60, "random", "Watch", 0x0006))
+
+    def test_payloads_are_kept_as_bytes(self):
+        bthome = "0000fcd2-0000-1000-8000-00805f9b34fb"
+        dev = NS(address="a4:c1:38:00:00:01", details={"path": "x", "props": {"AddressType": "public", "RSSI": -70}})
+        a = advert_from(dev, self.adv(mfr={0x0499: bytearray(b"\x05\x12")}, service={bthome: bytearray(b"\x40\x01\x61")}))
+        self.assertEqual(a.manufacturer_data, {0x0499: b"\x05\x12"})
+        self.assertEqual(a.service_data, {bthome: b"\x40\x01\x61"})
+        self.assertIs(type(a.service_data[bthome]), bytes)
+        self.assertEqual(a.manufacturer, 0x0499)
+        empty = advert_from(dev, self.adv())
+        self.assertEqual((empty.manufacturer_data, empty.service_data), ({}, {}))
 
     def test_other_backend_has_no_address_type(self):
         a = advert_from(NS(address="C0:AA:BB:CC:DD:EE", details=object()), self.adv(name=None))

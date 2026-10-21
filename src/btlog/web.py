@@ -2,9 +2,9 @@
 
 One page: the devices on the left, and for the selected one (or all of them)
 presence by hour of day and by weekday, a day-by-hour heatmap, signal strength
-per day, and the new devices of the week. The same data is served as JSON
-under /api/. Device names come from strangers' advertisements, so the page
-escapes everything it puts into HTML.
+and sensor readings per day, and the new devices of the week. The same data is
+served as JSON under /api/. Device names come from strangers' advertisements,
+so the page escapes everything it puts into HTML.
 
 The server opens the database read-only, once per request: SQLite connections
 are per thread and ThreadingHTTPServer gives every request its own. There is no
@@ -64,6 +64,7 @@ PAGE ="""<!doctype html>
     <h2>By weekday</h2><div class="chart" id="days"></div><div class="labels" id="daylabels"></div>
     <h2 id="heattitle">Day by hour</h2><div class="heat" id="heat"></div>
     <div id="rssiwrap" hidden><h2>Signal per day (average dBm)</h2><div class="chart" id="rssi"></div><div class="labels" id="rssilabels"></div></div>
+    <div id="readings" hidden></div>
     <h2>New devices in the last 7 days</h2><div id="new" class="mono"></div>
   </section>
 </main>
@@ -79,7 +80,7 @@ function chart(el, labels, values, fmt, lo, hi) {
   const vals = values.filter(v => v != null);
   lo = lo ?? 0; hi = hi ?? vals.reduce((m, v) => Math.max(m, v), 1e-9);
   el.chart.innerHTML = values.map((v, i) => v == null ? `<div class="none" title="${labels[i]}: no data"></div>`
-    : `<div style="height:${Math.min(100, Math.max(2, (v - lo) / (hi - lo) * 100))}%" title="${labels[i]}: ${fmt(v)}"></div>`).join('');
+    : `<div style="height:${Math.min(100, Math.max(2, (v - lo) / (hi - lo) * 100))}%" title="${labels[i]}: ${fmt(v, i)}"></div>`).join('');
   el.labels.innerHTML = labels.map((l, i) => `<span>${labels.length > 12 && i % 2 ? '' : l}</span>`).join('');
 }
 const pct = v => Math.round(v * 100) + '%', num = v => v.toFixed(1);
@@ -114,12 +115,29 @@ async function load() {
     chart({ chart: $('#days'), labels: $('#daylabels') }, WD, days, fmt, 0, hi);
     heat(rows, fmt);
     $('#hourstitle').textContent = selected ? 'Presence by hour of day (share of scan cycles)' : 'Devices heard per scan cycle, by hour of day';
+    let rd = [];
     if (selected) {
-      const r = await api('/api/rssi', dev);
+      let r;
+      [r, rd] = await Promise.all([api('/api/rssi', dev), api('/api/readings', dev)]);
       chart({ chart: $('#rssi'), labels: $('#rssilabels') }, r.map(x => x.when.slice(5)), r.map(x => x.avg), v => v.toFixed(1) + ' dBm', -100, -30);
+      readings(rd);
     }
     $('#rssiwrap').hidden = !selected;
+    $('#readings').hidden = !rd.length;
   } catch (e) { $('#status').textContent = 'error: ' + e; }
+}
+// One chart per kind, each spanning its own lowest to highest value: from zero,
+// a day at 19 °C and one at 23 °C would draw the same bar. A flat series (a
+// battery at 94 % all week) gets full bars rather than empty-looking ones.
+function readings(rows) {
+  const kinds = [...new Set(rows.map(r => r.kind))];
+  $('#readings').innerHTML = kinds.map((k, i) => `<h2>Readings: ${esc(k)} per day (average ${esc(rows.find(r => r.kind === k).unit)}, min / avg / max on hover)</h2>
+    <div class="chart" id="rk${i}"></div><div class="labels" id="rl${i}"></div>`).join('');
+  kinds.forEach((k, i) => {
+    const rs = rows.filter(r => r.kind === k), lo = Math.min(...rs.map(r => r.min)), hi = Math.max(...rs.map(r => r.max));
+    chart({ chart: $('#rk' + i), labels: $('#rl' + i) }, rs.map(r => esc(r.when.slice(5))), rs.map(r => r.avg),
+      (v, j) => esc(`${rs[j].min.toFixed(2)} / ${v.toFixed(2)} / ${rs[j].max.toFixed(2)} ${rs[j].unit}`), lo < hi ? lo : lo - 1, hi);
+  });
 }
 async function devices() {
   const list = await api('/api/devices', {}), st = await api('/api/status', {});
@@ -205,6 +223,12 @@ class Handler(BaseHTTPRequestHandler):
             if did is None:
                 raise ValueError("device required")
             return trends.rssi(store, did, since, until, by=q.get("by", "day"))
+        if path == "/api/readings":
+            if did is None:
+                raise ValueError("device required")
+            return trends.readings(store, did, q.get("kind") or None, since, until, by=q.get("by", "day"))
+        if path == "/api/now":
+            return store.now()
         if path == "/api/new":
             if since is None:
                 raise ValueError("since required")

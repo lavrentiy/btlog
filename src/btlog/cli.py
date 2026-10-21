@@ -7,6 +7,8 @@ Bluetooth LE devices in proximity, and answers questions about the trends.
   btlog days [DEVICE]              presence per weekday
   btlog heat [DEVICE] [--since 14d] presence calendar: one row per day, one cell per hour
   btlog rssi DEVICE [--by hour]    signal strength over time
+  btlog readings DEVICE [--kind K] sensor readings over time: min, average and max (--by hour)
+  btlog now                        the last scan cycle: devices heard, and the latest sensor readings
   btlog new [--since 1d]           devices seen for the first time recently
   btlog top [--since 7d]           devices around the most
   btlog name DEVICE LABEL          label a device ("" removes the label)
@@ -175,6 +177,40 @@ def cmd_rssi(store, a):
     emit(a, rows, text)
 
 
+def cmd_readings(store, a):
+    d = store.find(a.device)
+    rows = trends.readings(store, d["id"], a.kind, *period(a), by=a.by)
+    # Each kind's bars span its own lowest to highest value on screen: drawn
+    # from zero, a day at 19 °C and one at 23 °C would look the same. A flat
+    # series (a battery at 94 % all week) gets full bars, not empty ones.
+    span = {}
+    for r in rows:
+        lo, hi = span.get(r["kind"], (r["min"], r["max"]))
+        span[r["kind"]] = min(lo, r["min"]), max(hi, r["max"])
+    span = {k: (lo if lo < hi else lo - 1, hi) for k, (lo, hi) in span.items()}
+    width = max((len(r["kind"]) for r in rows), default=0)
+    lines = [f"readings of {d['address']} {who(d)} by {a.by} {period_text(a)} (min / average / max)"]
+    for r in rows:
+        lo, hi = span[r["kind"]]
+        lines.append(f"{r['when']}  {r['kind']:<{width}}  {bar(r['avg'] - lo, hi - lo)}  "
+                     f"{r['min']:7.2f} / {r['avg']:7.2f} / {r['max']:7.2f} {r['unit']}".rstrip())
+    if not rows:
+        lines.append("no readings in this period")
+    emit(a, rows, "\n".join(lines))
+
+
+def cmd_now(store, a):
+    n = store.now()
+    lines = [f"last scan cycle {when.fmt(n['last_cycle'], seconds=True)}, {len(n['devices'])} devices heard",
+             table([[d["address"], d["kind"], who(d), d["rssi"]] for d in n["devices"]],
+                   ["ADDRESS", "KIND", "LABEL/NAME", "RSSI"])]
+    if n["readings"]:
+        lines += ["", table([[who(r) or r["address"], r["kind"], f"{r['value']:g} {r['unit']}".rstrip(),
+                              when.ago(r["ts"]) + " ago"] for r in n["readings"]],
+                            ["SENSOR", "KIND", "VALUE", "HEARD"])]
+    emit(a, n, "\n".join(lines))
+
+
 def cmd_new(store, a):
     since, until = period(a)
     if since is None:
@@ -304,6 +340,10 @@ def parser():
     add("days", since="90d", device="optional")
     add("heat", since="14d", device="optional")
     add("rssi", since="7d", device=True).add_argument("--by", choices=["day", "hour"], default="day")
+    r = add("readings", since="7d", device=True)
+    r.add_argument("--kind", help="temperature, humidity, battery... (default: every kind)")
+    r.add_argument("--by", choices=["day", "hour"], default="day")
+    add("now")
     add("new", since="1d")
     add("top", since="7d").add_argument("-n", dest="limit", type=int, default=10)
     add("name", device=True).add_argument("label")

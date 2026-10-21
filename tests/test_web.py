@@ -9,7 +9,7 @@ from pathlib import Path
 
 from btlog import web
 from btlog.store import Store
-from helpers import BEACON, WATCH, adverts, at, fill_day
+from helpers import BEACON, WATCH, adverts, at, fill_day, thermometer
 
 
 class WebTest(unittest.TestCase):
@@ -19,7 +19,8 @@ class WebTest(unittest.TestCase):
         db = Path(cls.tmp.name) / "btlog.db"
         with Store(db) as store:
             fill_day(store, 19, {WATCH: set(range(6, 9)), BEACON: set(range(24))})
-            store.record_cycle(at(20, 8), adverts((WATCH, -55, "Garmin")))
+            # The watch doubles as a thermometer, so the device list stays the same.
+            store.record_cycle(at(20, 8), [*adverts((WATCH, -55, "Garmin")), thermometer(21.5, WATCH, name=None)])
             store.set_label(BEACON, "door")
         cls.srv = web.make_server(db, "127.0.0.1:0")
         cls.url = f"http://127.0.0.1:{cls.srv.server_address[1]}"
@@ -41,6 +42,7 @@ class WebTest(unittest.TestCase):
         self.assertEqual((status, ctype), (200, "text/html; charset=utf-8"))
         self.assertIn("<title>btlog</title>", body)
         self.assertIn("/api/hours", body)
+        self.assertIn("/api/readings", body)
         # Nothing from the database is baked into the page: it is all fetched
         # and escaped client-side, so a device called <script> stays text.
         self.assertNotIn("Garmin", body)
@@ -64,11 +66,26 @@ class WebTest(unittest.TestCase):
         self.assertEqual([r["when"] for r in rssi], ["2026-10-19", "2026-10-20"])
         self.assertEqual(json.loads(self.get("/api/new?since=2026-10-20")[2]), [])
 
+    def test_readings_and_now(self):
+        rows = json.loads(self.get("/api/readings?device=garmin&since=all")[2])
+        self.assertEqual(rows, [{"when": "2026-10-20", "kind": "temperature", "min": 21.5, "avg": 21.5, "max": 21.5, "unit": "°C"}])
+        rows = json.loads(self.get("/api/readings?device=garmin&since=all&by=hour&kind=temperature")[2])
+        self.assertEqual([r["when"] for r in rows], ["2026-10-20 08"])
+        self.assertEqual(json.loads(self.get("/api/readings?device=garmin&since=all&kind=humidity")[2]), [])
+        self.assertEqual(json.loads(self.get("/api/readings?device=door&since=all")[2]), [])
+        now = json.loads(self.get("/api/now")[2])
+        self.assertEqual(now["last_cycle"], at(20, 8))
+        self.assertEqual([(d["address"], d["name"], d["rssi"]) for d in now["devices"]], [(WATCH, "Garmin", -55)])
+        self.assertEqual([(r["address"], r["kind"], r["value"], r["unit"]) for r in now["readings"]],
+                         [(WATCH, "temperature", 21.5, "°C")])
+
     def test_bad_requests(self):
         for path, text in [("/api/hours?device=nobody", "no device matching"),
                            ("/api/hours?since=soon", "can't read time"),
                            ("/api/rssi", "device required"),
                            ("/api/rssi?device=garmin&by=week", "by must be"),
+                           ("/api/readings", "device required"),
+                           ("/api/readings?device=garmin&by=week", "by must be"),
                            ("/api/new?since=all", "since required")]:
             with self.assertRaises(urllib.error.HTTPError) as cm:
                 self.get(path)

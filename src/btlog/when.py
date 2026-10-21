@@ -2,7 +2,7 @@
 '2026-10-18', '2026-10-18T19:30' or 'all'.
 
 parse() gives unix seconds, the unit the sightings use (None for 'all');
-fmt() prints them as local time for tables.
+fmt() prints them as local time for tables, ago() as an age.
 """
 
 import re
@@ -44,3 +44,15 @@ def fmt(ts, seconds=False):
     if ts is None:
         return "-"
     return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S" if seconds else "%Y-%m-%d %H:%M")
+
+
+def ago(ts, now=None):
+    """How long before now ts was, in the units --since takes: '40s', '12m',
+    '3h', '2d'. Coarse on purpose: it says whether a reading is fresh."""
+    if ts is None:
+        return "-"
+    s = max(0, (datetime.now().timestamp() if now is None else now) - ts)
+    for unit in ("d", "h", "m"):
+        if s >= _UNIT[unit]:
+            return f"{int(s // _UNIT[unit])}{unit}"
+    return f"{int(s)}s"

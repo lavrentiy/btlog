@@ -1,17 +1,22 @@
-"""Shared by the tests: a scripted scanner source and a clock that steps.
+"""Shared by the tests: a scripted scanner source, a clock that steps, and
+adverts from a BTHome sensor.
 
 Times are built from local naive datetimes, so the hourly rollups land in the
 expected local hour whatever zone the test machine is in.
 """
 
+import struct
 from datetime import datetime, timedelta
 
+from btlog.decoders import SIG_BASE
 from btlog.scanner import Advert
 
 PHONE = "5A:11:22:33:44:55"     # 0x5A = 01.. : resolvable private address
 WATCH = "C0:AA:BB:CC:DD:EE"     # 0xC0 = 11.. : static random
 BEACON = "00:11:22:33:44:55"    # public
 NRPA = "3F:00:00:00:00:01"      # 0x3F = 00.. : non-resolvable private
+SENSOR = "A4:C1:38:00:00:01"    # public: a BTHome thermometer
+BTHOME = "0000fcd2" + SIG_BASE  # its service UUID, as bleak spells it
 
 
 def at(day, hour, minute=0):
@@ -32,6 +37,16 @@ def adverts(*specs):
         out.append(Advert(address, rssi, address_type=kind, name=rest[0] if rest else None,
                           manufacturer=rest[1] if len(rest) > 1 else None))
     return out
+
+
+def bthome(address, hexstr, rssi=-70, name=None):
+    """An advert carrying BTHome v2 service data, given as hex."""
+    return Advert(address, rssi, "public", name, service_data={BTHOME: bytes.fromhex(hexstr)})
+
+
+def thermometer(temperature, address=SENSOR, name="garden"):
+    """A BTHome v2 advert with one temperature, in its 0.01 °C object."""
+    return bthome(address, "4002" + struct.pack("<h", round(temperature * 100)).hex(), name=name)
 
 
 class ScriptedSource:
