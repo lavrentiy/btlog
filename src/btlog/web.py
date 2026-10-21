@@ -8,17 +8,20 @@ escapes everything it puts into HTML.
 
 The server opens the database read-only, once per request: SQLite connections
 are per thread and ThreadingHTTPServer gives every request its own. There is no
-authentication; keep it on localhost or a trusted network.
+authentication; keep it on localhost or a trusted network. Requests whose Host
+header is a DNS name other than the bind address are refused, so a web page
+cannot rebind its own name to 127.0.0.1 and read the API from the browser.
 """
 
+import ipaddress
 import json
 import logging
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
-from btlog import trends, vendors, when
-from btlog.store import Store
+from btlog import trends, when
+from btlog.store import Store, public
 
 log = logging.getLogger("btlog")
 
@@ -75,13 +78,23 @@ function chart(el, labels, values, fmt, lo, hi) {
   const vals = values.filter(v => v != null);
   lo = lo ?? 0; hi = hi ?? vals.reduce((m, v) => Math.max(m, v), 1e-9);
   el.chart.innerHTML = values.map((v, i) => v == null ? `<div class="none" title="${labels[i]}: no data"></div>`
-    : `<div style="height:${Math.max(2, (v - lo) / (hi - lo) * 100)}%" title="${labels[i]}: ${fmt(v)}"></div>`).join('');
+    : `<div style="height:${Math.min(100, Math.max(2, (v - lo) / (hi - lo) * 100))}%" title="${labels[i]}: ${fmt(v)}"></div>`).join('');
   el.labels.innerHTML = labels.map((l, i) => `<span>${labels.length > 12 && i % 2 ? '' : l}</span>`).join('');
 }
 const pct = v => Math.round(v * 100) + '%', num = v => v.toFixed(1);
+// Every calendar day from the first to the last, so a day the scanner was off
+// shows as a row of gaps instead of vanishing. Noon keeps the step clear of DST.
+function allDays(days) {
+  const keys = [...days.keys()].sort(); if (!keys.length) return days;
+  const ymd = d => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  const out = new Map();
+  for (let d = new Date(keys[0] + 'T12:00:00'); ymd(d) <= keys[keys.length - 1]; d.setDate(d.getDate() + 1)) out.set(ymd(d), days.get(ymd(d)) || Array(24).fill(null));
+  return out;
+}
 function heat(rows, fmt) {
-  const days = new Map();
-  rows.forEach(r => { if (!days.has(r.day)) days.set(r.day, Array(24).fill(null)); days.get(r.day)[r.hour] = r.presence; });
+  const seen = new Map();
+  rows.forEach(r => { if (!seen.has(r.day)) seen.set(r.day, Array(24).fill(null)); seen.get(r.day)[r.hour] = r.presence; });
+  const days = allDays(seen);
   const hi = selected ? 1 : rows.reduce((m, r) => Math.max(m, r.presence), 1e-9);
   let html = '<span></span>' + [...Array(24).keys()].map(h => `<span>${h % 3 ? '' : String(h).padStart(2, '0')}</span>`).join('');
   for (const [day, cells] of days) html += `<span>${day.slice(5)}</span>` + cells.map((v, h) => v == null
@@ -124,24 +137,42 @@ $('#list').addEventListener('click', e => {
   load();
 });
 $('#since').addEventListener('change', load);
-devices().then(load);
-setInterval(() => { devices(); load(); }, 60000);
+const refresh = () => devices().catch(e => { $('#status').textContent = 'error: ' + e; }).then(load);
+refresh();
+setInterval(refresh, 60000);
 </script>
 """
 
 
 class Handler(BaseHTTPRequestHandler):
     db = None
+    bind_host = ""
     server_version = "btlog"
     timeout = 10  # a client that connects and says nothing does not pin a thread
 
     def log_message(self, *args):
         pass
 
+    def host_ok(self):
+        """True for a Host a browser sends when the user typed the address:
+        localhost, an IP literal, or the name the server was bound to. A
+        rebinding page arrives under its own DNS name, which is none of those."""
+        host = self.headers.get("Host", "")
+        name = host.split("]")[0] + "]" if host.startswith("[") else host.rsplit(":", 1)[0]
+        if name in ("localhost", self.bind_host):
+            return True
+        try:
+            ipaddress.ip_address(name.strip("[]"))
+            return True
+        except ValueError:
+            return False
+
     def do_GET(self):
         url = urlsplit(self.path)
         q = {k: v[-1] for k, v in parse_qs(url.query).items()}
         try:
+            if not self.host_ok():
+                return self.error(HTTPStatus.MISDIRECTED_REQUEST, "use the address the dashboard is bound to")
             if url.path == "/":
                 return self.reply(PAGE.encode(), "text/html; charset=utf-8")
             with Store(self.db, readonly=True) as store:
@@ -160,9 +191,9 @@ class Handler(BaseHTTPRequestHandler):
         until = when.parse(q["until"]) if q.get("until") else None
         did = store.find(q["device"])["id"] if q.get("device") else None
         if path == "/api/status":
-            return store.status()
+            return store.status(sightings=False)  # counting every sighting is CLI-only work
         if path == "/api/devices":
-            return [_public(d) for d in store.devices(private=q.get("private") == "1")]
+            return [public(d) for d in store.devices(private=q.get("private") == "1")]
         if path == "/api/hours":
             return trends.hours(store, did, since, until)
         if path == "/api/days":
@@ -176,7 +207,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/new":
             if since is None:
                 raise ValueError("since required")
-            return [_public(d) for d in trends.new(store, since, until)]
+            return [public(d) for d in trends.new(store, since, until)]
         return None
 
     def reply(self, body, ctype, status=HTTPStatus.OK):
@@ -192,15 +223,11 @@ class Handler(BaseHTTPRequestHandler):
         self.reply(text.encode(), "text/plain; charset=utf-8", status)
 
 
-def _public(d):
-    return {k: v for k, v in d.items() if k != "id"} | {"vendor": vendors.name(d["manufacturer"])}
-
-
 def make_server(db, bind):
     host, _, port = bind.rpartition(":")
     if not host or not port.isdigit():
         raise ValueError(f"bind must be HOST:PORT, not {bind!r}")
-    handler = type("Handler", (Handler,), {"db": db})
+    handler = type("Handler", (Handler,), {"db": db, "bind_host": host})
     return ThreadingHTTPServer((host, int(port)), handler)
 
 

@@ -16,7 +16,7 @@ database and the same config file. Python 3.11+, one dependency
 
 | | |
 |---|---|
-| **Scans** | Every `interval` seconds (60 by default) it listens for BLE advertisements and records one sighting per device: time, address, address kind, name, manufacturer id, strongest RSSI, number of advertisements. |
+| **Scans** | Every `interval` seconds (60 by default) it listens for BLE advertisements and records one sighting per device: time, address, address kind, name, manufacturer id, strongest RSSI, number of reports from the Bluetooth stack. |
 | **Rolls up** | Each sighting also advances a per-device, per-local-hour rollup and a count of scan cycles per hour. Trends read the rollups, so they are instant and survive the raw data being purged. |
 | **Measures against uptime** | Presence is a share of the scan cycles that actually ran in that hour, not of the wall clock: a day the scanner was off does not look like a day nobody was home. |
 | **Forgets rotating addresses** | Phones and watches change their random address every few minutes. Such an address unseen for `forget_random_days` (7) is removed; only its contribution to "how many devices per hour" is kept, under one anonymous pseudo-device. |
@@ -68,11 +68,13 @@ presence of C0:AA:BB:CC:DD:EE my watch since 7d, one row per day, one cell per h
             0  3  6  9  12 15 18 21
 2026-10-14  ████▇█▇█  ····    █▇███▇
 2026-10-15  ████████          ██▇█▇▇
+2026-10-16  ························
 2026-10-17  ██▇▇▇▇██▇▇███▇███▇▇███▇█
 ```
 
 A `·` is an hour the scanner did not run; a blank cell is an hour it ran and
-did not hear the device.
+did not hear the device. Two devices with the same label are an error, not a
+guess; names and labels match case-insensitively in any script.
 
 Address kinds: `public` and `static` addresses identify a device for good;
 `rpa` (resolvable private) and `nrpa` (non-resolvable private) rotate every few
@@ -95,7 +97,9 @@ served as JSON under `/api/` (`status`, `devices`, `hours`, `days`, `timeline`,
 
 The dashboard opens the database read-only and never writes. Device names come
 from strangers' advertisements, so the page escapes everything before it goes
-into HTML. **It has no authentication.** Leave it on localhost and reach it over an SSH port forward
+into HTML, and requests under a DNS name other than the bind address get a
+421, so a web page you happen to have open cannot rebind its name to
+127.0.0.1 and read when the house is empty. **It has no authentication.** Leave it on localhost and reach it over an SSH port forward
 (`ssh -L 8778:127.0.0.1:8778 bench`) or Tailscale, or bind it to a trusted
 network only.
 
@@ -144,7 +148,9 @@ forget_random_days = 0    # never remove rotating private addresses
 That is the whole change for a shop that wants a log to hand over after a
 break-in, with `btlog export --since 2026-10-17 --until 2026-10-18 --json` as
 the output, `sha256sum` on the file as the seal, and `btlog backup` for the
-nightly copy (a plain file copy of a database in WAL mode can tear). Know what you are getting: a rotating
+nightly copy (a plain file copy of a database in WAL mode can tear). The CSV
+form is for people and spreadsheets: a name that starts like a formula gets a
+leading apostrophe there, so prefer `--json` for the sealed copy. Know what you are getting: a rotating
 address still cannot be tied to a person without that person's device, a
 signal strength does not say inside or outside, and logging the devices of
 everyone who walks past is processing their personal data, which in the EU
@@ -173,7 +179,9 @@ btlog.nixosModules.default
 
 The module enables `hardware.bluetooth` and runs the scanner as its own `btlog`
 user with a hardened systemd unit that has no network at all (`PrivateNetwork`),
-only the system D-Bus socket to reach BlueZ. The daemon logs one summary line
+only the system D-Bus socket to reach BlueZ. The database belongs to that user
+alone, so on the box run the CLI as `sudo -u btlog btlog devices` (or use the
+dashboard). The daemon logs one summary line
 per hour; `BTLOG_DEBUG=1` in the environment logs every cycle. The dashboard is a second unit under the same user
 (SQLite's WAL needs readers to share the writer's `-shm` file) with the database
 opened read-only.

@@ -84,6 +84,19 @@ class WebTest(unittest.TestCase):
         self.assertEqual(cm.exception.code, 404)
         cm.exception.close()
 
+    def test_foreign_host_header_is_refused(self):
+        # A rebinding page reaches the server under its own DNS name.
+        for host, code in [("evil.example:8778", 421), ("evil.example", 421), ("localhost:1", 200),
+                           ("127.0.0.1", 200), ("[::1]:8778", 200), ("192.168.1.5", 200)]:
+            req = urllib.request.Request(self.url + "/api/status", headers={"Host": host})
+            try:
+                with urllib.request.urlopen(req) as r:
+                    self.assertEqual((host, r.status), (host, code))
+                    self.assertIsNone(json.loads(r.read())["sightings"])
+            except urllib.error.HTTPError as e:
+                self.assertEqual((host, e.code), (host, code))
+                e.close()
+
     def test_bind_parsing(self):
         with self.assertRaises(ValueError):
             web.make_server("x.db", "8778")

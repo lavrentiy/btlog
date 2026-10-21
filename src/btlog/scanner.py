@@ -22,7 +22,6 @@ class Advert:
     address_type: str | None = None   # "public" or "random" when the backend says
     name: str | None = None
     manufacturer: int | None = None   # Bluetooth SIG company id
-    services: tuple = ()
 
 
 def advert_from(device, adv):
@@ -41,8 +40,7 @@ def advert_from(device, adv):
     return Advert(
         address=device.address.upper(), rssi=adv.rssi,
         address_type=props.get("AddressType"), name=adv.local_name,
-        manufacturer=min(adv.manufacturer_data) if adv.manufacturer_data else None,
-        services=tuple(adv.service_uuids))
+        manufacturer=min(adv.manufacturer_data) if adv.manufacturer_data else None)
 
 
 class BleakSource:
@@ -52,14 +50,19 @@ class BleakSource:
     BlueZ per loop, so a loop per cycle would reconnect to D-Bus and re-read
     every known device each minute. Discovery itself is started afresh each
     cycle, which has BlueZ report everything in range again.
+
+    A cycle is given grace seconds beyond its own length: a wedged adapter or
+    bluetoothd would otherwise block a D-Bus call forever while systemd still
+    sees a live process. The timeout surfaces as an error that run() retries.
     """
 
-    def __init__(self, adapter=None):
+    def __init__(self, adapter=None, grace=30):
         self.adapter = adapter
+        self.grace = grace
         self.loop = asyncio.new_event_loop()
 
     def scan(self, seconds):
-        return self.loop.run_until_complete(self._scan(seconds))
+        return self.loop.run_until_complete(asyncio.wait_for(self._scan(seconds), seconds + self.grace))
 
     async def _scan(self, seconds):
         from bleak import BleakScanner

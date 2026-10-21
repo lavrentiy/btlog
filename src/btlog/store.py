@@ -1,6 +1,6 @@
 """SQLite storage: every sighting, plus hourly rollups that outlive the raw rows.
 
-  devices    one row per address: kind, best name, optional label, first/last seen.
+  devices    one row per address: kind, latest name, optional label, first/last seen.
   sightings  one row per device per scan cycle, with the strongest RSSI heard in
              that cycle. Deleted after retention_days; this is the bulk of the file.
   hourly     per device per local hour: cycles heard, best and summed RSSI. Tiny
@@ -19,9 +19,12 @@ rows are folded into a single "forgotten" pseudo-device first, so the count of
 devices around per hour stays right after the address is gone.
 """
 
+import os
 import sqlite3
 from datetime import datetime
 from pathlib import Path
+
+from btlog import vendors
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS devices (
@@ -39,7 +42,7 @@ CREATE TABLE IF NOT EXISTS sightings (
     ts REAL NOT NULL,
     device_id INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
     rssi INTEGER NOT NULL,
-    adverts INTEGER NOT NULL,       -- advertisements heard in the cycle
+    adverts INTEGER NOT NULL,       -- reports from the Bluetooth stack in the cycle
     PRIMARY KEY (device_id, ts)
 ) WITHOUT ROWID;
 CREATE INDEX IF NOT EXISTS sightings_ts ON sightings(ts);
@@ -53,6 +56,7 @@ CREATE TABLE IF NOT EXISTS hourly (
     rssi_sum INTEGER NOT NULL,
     PRIMARY KEY (device_id, day, hour)
 ) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS hourly_hour ON hourly(day, hour);  -- the all-device queries
 CREATE TABLE IF NOT EXISTS cycles (
     day TEXT NOT NULL,
     hour INTEGER NOT NULL,
@@ -123,12 +127,29 @@ def _row(cursor, row):
     return {d[0]: row[i] for i, d in enumerate(cursor.description)}
 
 
+def _fold(text):
+    """Case folding for SQL: SQLite's own upper() only knows ASCII, so "Zoë"
+    would never match "zoë" without this."""
+    return text.casefold() if text is not None else None
+
+
+def public(d):
+    """A device row for JSON output: times as unix seconds, the vendor named,
+    nothing internal."""
+    return {k: v for k, v in d.items() if k != "id"} | {"vendor": vendors.name(d["manufacturer"])}
+
+
 class Store:
     def __init__(self, path, readonly=False):
         """Open (and create) the database. readonly opens at the SQLite level, so
         the dashboard and the CLI cannot modify anything even by mistake."""
         path = Path(path)
         if readonly:
+            # exists() is False on a permission error too, which would send a
+            # user who is simply not the btlog user looking for a dead daemon.
+            if (path.parent.is_dir() and not os.access(path.parent, os.R_OK | os.X_OK)) or \
+                    (path.exists() and not os.access(path, os.R_OK)):
+                raise PermissionError(f"cannot read {path} (run as the daemon's user, e.g. sudo -u btlog)")
             if not path.exists():
                 raise FileNotFoundError(f"no database at {path} (is the daemon running?)")
             self.conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
@@ -140,6 +161,7 @@ class Store:
             self.conn.executescript(SCHEMA)
         self.conn.row_factory = _row
         self.conn.execute("PRAGMA foreign_keys=ON")
+        self.conn.create_function("fold", 1, _fold, deterministic=True)
 
     def close(self):
         self.conn.close()
@@ -250,35 +272,51 @@ class Store:
 
     # ---------- Reading ----------
 
-    def devices(self, since=None, private=False):
-        """Devices by last sighting, newest first. since limits to those seen after
-        it. Rotating private addresses are left out unless private is set: a phone
-        alone leaves a hundred of them a day, which would bury the real list."""
+    def _seen(self, since, until, private):
+        """WHERE clause for devices seen in a period: rotating private addresses
+        are left out unless asked for, as a phone alone leaves a hundred a day."""
         where, args = ["kind != ?"], [FORGOTTEN]
         if since is not None:
             where.append("last_seen >= ?")
             args.append(since)
+        if until is not None:
+            where.append("first_seen < ?")
+            args.append(until)
         if not private:
             where.append("kind NOT IN (?, ?)")
             args += PRIVATE_KINDS
+        return " AND ".join(where), args
+
+    def devices(self, since=None, until=None, private=False):
+        """Devices whose first-to-last span overlaps the period, by last
+        sighting, newest first. That is the devices table alone, no sighting
+        lookup, so a device absent for a day inside its span still lists."""
+        where, args = self._seen(since, until, private)
         return self.conn.execute(
             f"""SELECT d.*, (SELECT COUNT(*) FROM hourly WHERE device_id = d.id) AS hours
-                FROM devices d WHERE {' AND '.join(where)} ORDER BY last_seen DESC, address""", args).fetchall()
+                FROM devices d WHERE {where} ORDER BY last_seen DESC, address""", args).fetchall()
+
+    def private_count(self, since=None, until=None):
+        """How many rotating private addresses devices() left out."""
+        where, args = self._seen(since, until, True)
+        return self.conn.execute(
+            f"SELECT COUNT(*) AS n FROM devices WHERE {where} AND kind IN (?, ?)", args + list(PRIVATE_KINDS)).fetchone()["n"]
 
     def find(self, text):
         """The one device whose address, label or name is text or starts with it,
         case insensitively. An exact address or label wins over prefix matches;
-        anything else ambiguous is an error rather than a guess."""
-        t = text.strip().upper()
+        anything else ambiguous, including two devices with the same label, is
+        an error rather than a guess."""
+        t = text.strip().casefold()
         like = t.replace("%", "\\%").replace("_", "\\_") + "%"
         rows = self.conn.execute(
-            """SELECT *, (address = ? OR upper(label) = ?) AS exact FROM devices WHERE kind != ? AND
-               (address LIKE ? ESCAPE '\\' OR upper(label) LIKE ? ESCAPE '\\' OR upper(name) LIKE ? ESCAPE '\\')
+            """SELECT *, (fold(address) = ? OR fold(label) = ?) AS exact FROM devices WHERE kind != ? AND
+               (fold(address) LIKE ? ESCAPE '\\' OR fold(label) LIKE ? ESCAPE '\\' OR fold(name) LIKE ? ESCAPE '\\')
                ORDER BY exact DESC, last_seen DESC""",
             (t, t, FORGOTTEN, like, like, like)).fetchall()
         if not rows:
             raise LookupError(f"no device matching {text!r}")
-        if len(rows) > 1 and not rows[0]["exact"]:
+        if len(rows) > 1 and (not rows[0]["exact"] or rows[1]["exact"]):
             raise LookupError(f"{text!r} matches {len(rows)} devices; use the full address")
         return {k: v for k, v in rows[0].items() if k != "exact"}
 
@@ -299,12 +337,14 @@ class Store:
                 FROM sightings s JOIN devices d ON d.id = s.device_id
                 WHERE {' AND '.join(where)} ORDER BY s.ts, d.address""", args)
 
-    def status(self):
+    def status(self, sightings=True):
         """Counts and the last cycle, for `btlog status` and the dashboard header."""
-        return self.conn.execute(
+        s = self.conn.execute(
             """SELECT (SELECT COUNT(*) FROM devices WHERE kind NOT IN ('rpa', 'nrpa', 'forgotten')) AS devices,
                       (SELECT COUNT(*) FROM devices WHERE kind IN ('rpa', 'nrpa')) AS private,
-                      (SELECT COUNT(*) FROM sightings) AS sightings,
                       (SELECT COALESCE(SUM(count), 0) FROM cycles) AS cycles,
                       (SELECT MAX(last_ts) FROM cycles) AS last_cycle,
                       (SELECT MIN(day) FROM cycles) AS first_day""").fetchone()
+        # Counting sightings walks the whole index, so the dashboard skips it.
+        s["sightings"] = self.conn.execute("SELECT COUNT(*) AS n FROM sightings").fetchone()["n"] if sightings else None
+        return s

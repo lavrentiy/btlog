@@ -133,7 +133,10 @@ in
     systemd.services.btlog = {
       description = "Log of Bluetooth LE devices in proximity";
       wantedBy = [ "multi-user.target" ];
-      after = [ "bluetooth.service" ];
+      # time-sync: on a board without a clock, cycles logged before NTP lands
+      # under the wrong day and stay in the rollups forever.
+      after = [ "bluetooth.service" "time-sync.target" ];
+      wants = [ "time-sync.target" ];
       requires = [ "bluetooth.service" ];
       restartTriggers = [ configFile ];
       serviceConfig = hardening // {
@@ -167,6 +170,7 @@ in
         Restart = "always";
         RestartSec = 5;
         StateDirectory = stateDirectory;
+        StateDirectoryMode = "0750";   # systemd re-applies the mode on every start
         ReadWritePaths = [ cfg.stateDir ];
         RestrictAddressFamilies = [ "AF_INET" "AF_INET6" "AF_UNIX" ];
       };

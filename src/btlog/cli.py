@@ -32,8 +32,10 @@ import sqlite3
 import sys
 import time
 
+from datetime import date, timedelta
+
 from btlog import __version__, config as cfg, trends, vendors, when
-from btlog.store import Store
+from btlog.store import Store, public
 
 BAR = " ▁▂▃▄▅▆▇█"
 HOURS = [f"{h:02d}" for h in range(24)]
@@ -78,11 +80,6 @@ def device_row(d):
             when.fmt(d["first_seen"]), when.fmt(d["last_seen"]), d["hours"]]
 
 
-def public(d):
-    """A device as JSON: times as unix seconds, the vendor named, nothing internal."""
-    return {k: v for k, v in d.items() if k != "id"} | {"vendor": vendors.name(d["manufacturer"])}
-
-
 def presence(values, labels, device):
     """One line per slot. A device's presence is a share and is drawn against
     100%, so a device around 20% of the time gets a short bar; device counts
@@ -107,12 +104,11 @@ def period_text(a):
 # ---------- Commands ----------
 
 def cmd_devices(store, a):
-    since = when.parse(a.since)
-    rows = store.devices(since, private=a.private)
+    since, until = period(a)
+    rows = store.devices(since, until, private=a.private)
     text = table([device_row(d) for d in rows], ["ADDRESS", "KIND", "LABEL/NAME", "VENDOR", "FIRST SEEN", "LAST SEEN", "HOURS"])
     if not a.private:
-        n = len(store.devices(since, private=True)) - len(rows)
-        text += f"\n({n} rotating private addresses not shown; --private lists them)"
+        text += f"\n({store.private_count(since, until)} rotating private addresses not shown; --private lists them)"
     emit(a, [public(d) for d in rows], text)
 
 
@@ -145,12 +141,20 @@ def cmd_days(store, a):
 
 
 def cmd_heat(store, a):
-    """One row per day, one cell per hour: a presence calendar."""
+    """One row per day, one cell per hour: a presence calendar. Every day from
+    the first to the last gets a row, so a day the scanner was off is a row of
+    dots rather than a missing line."""
     d = store.find(a.device) if a.device else None
     rows = trends.timeline(store, d["id"] if d else None, *period(a))
-    days = {}
+    seen = {}
     for r in rows:
-        days.setdefault(r["day"], [None] * 24)[r["hour"]] = r["presence"]
+        seen.setdefault(r["day"], [None] * 24)[r["hour"]] = r["presence"]
+    days = {}
+    if seen:
+        first, last = date.fromisoformat(min(seen)), date.fromisoformat(max(seen))
+        for n in range((last - first).days + 1):
+            day = (first + timedelta(days=n)).isoformat()
+            days[day] = seen.get(day, [None] * 24)
     if d:
         title, scale = f"presence of {d['address']} {who(d)}".rstrip(), 1.0
     else:
@@ -200,9 +204,18 @@ def cmd_forget(store, a):
     print(f"{d['address']} {who(d)} forgotten, with {d['cycles']} sightings".replace("  ", " "))
 
 
+def csv_text(text):
+    """A name or label as a CSV cell that a spreadsheet will not run: one that
+    starts like a formula (=, +, -, @) gets a leading apostrophe, the usual
+    way to force text. Names come from strangers' advertisements."""
+    text = text or ""
+    return "'" + text if text[:1] in ("=", "+", "-", "@") else text
+
+
 def cmd_export(store, a):
     """Sightings as CSV: unix seconds and local time, so the hour that repeats
-    when daylight saving ends is still unambiguous."""
+    when daylight saving ends is still unambiguous. --json gives the rows as
+    they are, for a sealed copy."""
     did = store.find(a.device)["id"] if a.device else None
     rows = store.sightings(*period(a), device_id=did)
     if a.json:
@@ -210,8 +223,8 @@ def cmd_export(store, a):
     out = csv.writer(sys.stdout, lineterminator="\n")
     out.writerow(["ts", "time", "address", "kind", "name", "label", "rssi", "adverts"])
     for s in rows:
-        out.writerow([int(s["ts"]), when.fmt(s["ts"], seconds=True), s["address"], s["kind"], s["name"] or "",
-                      s["label"] or "", s["rssi"], s["adverts"]])
+        out.writerow([int(s["ts"]), when.fmt(s["ts"], seconds=True), s["address"], s["kind"], csv_text(s["name"]),
+                      csv_text(s["label"]), s["rssi"], s["adverts"]])
 
 
 def cmd_backup(store, a):
@@ -228,8 +241,9 @@ def cmd_purge(store, a, conf):
 def cmd_status(store, a, conf):
     s = store.status()
     stale = s["last_cycle"] is None or time.time() - s["last_cycle"] > 3 * conf.interval
-    emit(a, {**s, "stale": stale}, "\n".join([
-        f"database   {conf.db}",
+    size = sum(os.path.getsize(f) for f in (str(conf.db), f"{conf.db}-wal") if os.path.exists(f))
+    emit(a, {**s, "stale": stale, "bytes": size}, "\n".join([
+        f"database   {conf.db} ({size / 1e6:.1f} MB)",
         f"devices    {s['devices']} (plus {s['private']} rotating private addresses)",
         f"sightings  {s['sightings']} (kept {conf.retention_days or 'ever'} days)",
         f"cycles     {s['cycles']} since {s['first_day'] or '-'}",
@@ -246,7 +260,8 @@ def cmd_daemon(conf):
     from btlog.scanner import BleakSource, run
     logging.basicConfig(level=logging.DEBUG if os.environ.get("BTLOG_DEBUG") else logging.INFO,
                         format="%(asctime)s %(levelname)s %(message)s", stream=sys.stdout)
-    # SystemExit unwinds through the event loop, which stops discovery cleanly.
+    # SystemExit ends the process without unwinding the scan coroutine. That is
+    # fine: BlueZ stops a client's discovery when its D-Bus connection closes.
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     with Store(conf.db) as store:
         logging.getLogger("btlog").info("scanning every %gs into %s", conf.interval, conf.db)

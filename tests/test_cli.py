@@ -3,6 +3,7 @@ import io
 import json
 import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -117,6 +118,34 @@ class CliTest(unittest.TestCase):
         _, out, _ = self.run_cli("heat", "--since", "all", "--until", "2026-10-19T03:00")
         self.assertIn("since all until 2026-10-19T03:00", out)
         self.assertEqual(out.splitlines()[2], "2026-10-19  ███" + "·" * 21)
+
+    def test_csv_cells_cannot_be_formulas(self):
+        db = self.other_db((at(21, 9), adverts(("DE:AD:BE:EF:00:03", -60, '=HYPERLINK("http://x")'))))
+        _, out, _ = self.run_cli("export", "--since", "all", db=db)
+        self.assertIn(",'=HYPERLINK(\"\"http://x\"\")", out.replace('"\'=', "'="))
+        self.assertTrue(out.splitlines()[1].split(",")[4].startswith("\"'="))
+        _, out, _ = self.run_cli("export", "--since", "all", "--json", db=db)
+        self.assertEqual(json.loads(out)[0]["name"], '=HYPERLINK("http://x")')
+
+    def test_devices_until(self):
+        _, out, _ = self.run_cli("--json", "devices", "--until", "2026-10-20")
+        self.assertEqual([d["address"] for d in json.loads(out)], [WATCH, BEACON])
+        _, out, _ = self.run_cli("--json", "devices", "--until", "2026-10-19T05:00")
+        self.assertEqual([d["address"] for d in json.loads(out)], [BEACON])
+
+    def test_heat_shows_a_day_the_scanner_was_off(self):
+        db = self.other_db((at(19, 8), adverts((WATCH, -60))), (at(21, 8), adverts((WATCH, -60))))
+        _, out, _ = self.run_cli("heat", "--since", "all", db=db)
+        self.assertEqual([line[:10] for line in out.splitlines()[2:]], ["2026-10-19", "2026-10-20", "2026-10-21"])
+        self.assertEqual(out.splitlines()[3], "2026-10-20  " + "·" * 24)
+
+    def test_status_fresh_and_size(self):
+        db = self.other_db((time.time(), adverts((WATCH, -60))))
+        code, out, _ = self.run_cli("status", "--check", db=db)
+        self.assertEqual(code, 0)
+        self.assertNotIn("stale", out)
+        _, out, _ = self.run_cli("--json", "status", db=db)
+        self.assertGreater(json.loads(out)["bytes"], 10000)
 
     def test_backup(self):
         copy = Path(self.tmp.name) / "backup.db"

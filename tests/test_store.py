@@ -88,6 +88,24 @@ class RecordTest(unittest.TestCase):
         self.assertEqual(self.store.find("garmin")["address"], BEACON)
         with self.assertRaisesRegex(LookupError, "matches 2"):
             self.store.find("garm")
+        self.store.set_label(PHONE, "garmin")   # two exact labels: a guess would be wrong
+        with self.assertRaisesRegex(LookupError, "matches"):
+            self.store.find("Garmin")
+
+    def test_find_folds_case_beyond_ascii(self):
+        self.store.record_cycle(at(19, 8), adverts((WATCH, -60, "Zoë's Watch")))
+        for text in ("zoë", "ZOË'S WATCH", "Zoë"):
+            self.assertEqual(self.store.find(text)["address"], WATCH, text)
+        self.store.set_label(WATCH, "Ærmbånd")
+        self.assertEqual(self.store.find("ærmbånd")["address"], WATCH)
+
+    def test_devices_until_and_private_count(self):
+        self.store.record_cycle(at(19, 8), adverts((WATCH, -60), (PHONE, -60)))
+        self.store.record_cycle(at(20, 8), adverts((BEACON, -60), (NRPA, -60)))
+        self.assertEqual([d["address"] for d in self.store.devices(until=at(20, 0))], [WATCH])
+        self.assertEqual(self.store.private_count(), 2)
+        self.assertEqual(self.store.private_count(since=at(20, 0)), 1)
+        self.assertEqual(self.store.private_count(until=at(20, 0)), 1)
         self.assertEqual(self.store.find("5")["address"], PHONE)
         with self.assertRaises(LookupError):
             self.store.find("ZZ")
@@ -107,6 +125,7 @@ class RecordTest(unittest.TestCase):
         # quiet room must not look the same.
         self.store.record_cycle(at(19, 23, 50), [])
         self.assertEqual(self.store.status()["last_cycle"], at(19, 23, 50))
+        self.assertIsNone(self.store.status(sightings=False)["sightings"])
 
     def test_kind_upgrades_from_unknown_only(self):
         from btlog.scanner import Advert

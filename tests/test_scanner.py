@@ -1,11 +1,57 @@
+import asyncio
 import logging
+import sys
+import types
 import unittest
 from types import SimpleNamespace as NS
 
 from btlog.config import Config
-from btlog.scanner import advert_from, run
+from btlog.scanner import BleakSource, advert_from, run
 from btlog.store import Store
 from helpers import PHONE, WATCH, Clock, ScriptedSource, adverts, at
+
+
+class FakeScanner:
+    """Stands in for bleak.BleakScanner: calls back once on entry, and can hang
+    on exit the way a wedged bluetoothd would."""
+    kwargs = None
+    hang = 0
+
+    def __init__(self, callback, **kwargs):
+        self.callback = callback
+        FakeScanner.kwargs = kwargs
+
+    async def __aenter__(self):
+        dev = NS(address="c0:aa:bb:cc:dd:ee", details={"path": "x", "props": {"AddressType": "random", "RSSI": -55}})
+        self.callback(dev, NS(rssi=-55, local_name="Watch", manufacturer_data={}, service_uuids=[]))
+        return self
+
+    async def __aexit__(self, *exc):
+        await asyncio.sleep(FakeScanner.hang)
+
+
+class BleakSourceTest(unittest.TestCase):
+    def setUp(self):
+        fake = types.ModuleType("bleak")
+        fake.BleakScanner = FakeScanner
+        self.addCleanup(sys.modules.pop, "bleak", None)
+        sys.modules["bleak"] = fake
+        FakeScanner.hang = 0
+
+    def test_scan_collects_adverts_on_one_loop(self):
+        source = BleakSource("hci1")
+        self.addCleanup(source.loop.close)
+        first, second = source.scan(0.01), source.scan(0.01)
+        self.assertEqual([a.address for a in first], ["C0:AA:BB:CC:DD:EE"])
+        self.assertEqual(first, second)
+        self.assertEqual(FakeScanner.kwargs, {"adapter": "hci1"})
+
+    def test_hung_scan_times_out_and_is_retried(self):
+        FakeScanner.hang = 5
+        source = BleakSource(grace=0.05)
+        self.addCleanup(source.loop.close)
+        with self.assertRaises(TimeoutError):
+            source.scan(0.01)
 
 
 class AdvertFromTest(unittest.TestCase):
@@ -18,8 +64,8 @@ class AdvertFromTest(unittest.TestCase):
     def test_bluez_device(self):
         dev = NS(address="c0:aa:bb:cc:dd:ee", details={"path": "/org/bluez/hci0/dev_C0", "props": {"AddressType": "random", "RSSI": -60}})
         a = advert_from(dev, self.adv(mfr={0x004C: b"\x01", 0x0006: b"\x02"}, uuids=["180d"]))
-        self.assertEqual((a.address, a.rssi, a.address_type, a.name, a.manufacturer, a.services),
-                         ("C0:AA:BB:CC:DD:EE", -60, "random", "Watch", 0x0006, ("180d",)))
+        self.assertEqual((a.address, a.rssi, a.address_type, a.name, a.manufacturer),
+                         ("C0:AA:BB:CC:DD:EE", -60, "random", "Watch", 0x0006))
 
     def test_other_backend_has_no_address_type(self):
         a = advert_from(NS(address="C0:AA:BB:CC:DD:EE", details=object()), self.adv(name=None))
