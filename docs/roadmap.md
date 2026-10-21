@@ -1,0 +1,230 @@
+# Roadmap: from a log to a tool
+
+btlog records who comes by and how often. That is interesting to look at but
+rarely something you act on. This plan adds the parts that make it useful:
+readings from your own BLE sensors, alerts when something changes, and
+modes that set btlog up for one job: a home, a shed full of sensors, a shop
+that counts visitors, or a log kept as evidence.
+
+The current shape stays, because it works:
+
+- **One dependency.** bleak plus the standard library. Decoding is done
+  with `struct`, notifications with `urllib`. Anything that needs more
+  (Victron's encrypted readout needs AES) is left out.
+- **Rollups.** Every new measure gets an hourly rollup next to its raw rows,
+  with retention for the raw rows only. Trends stay instant after years.
+- **Presence against uptime.** Readings and counts are shares or averages
+  of the cycles the scanner actually ran.
+- **Private by default.** Anything that looks at other people's devices is
+  off unless a mode turns it on, and the README says what that mode means.
+- **Every phase ships on its own.** You can stop after any of them and have
+  a better tool than before.
+
+## Modes
+
+A mode is a named set of defaults for the existing and new config keys.
+It is not a separate code path: `mode = "sensors"` means the same as
+writing the keys it implies, and any key in the file still overrides it.
+So there is one daemon, one schema and one dashboard, and the tests cover
+the keys rather than every mode.
+
+| mode | for | stores | alerts by default | rotating addresses |
+|---|---|---|---|---|
+| `home` (default) | your place | every device, sensor readings | sensor silent, labelled device arrived or left | counted, forgotten after 7 days |
+| `sensors` | a shed, a van, a greenhouse | decoded sensors only; everything else is dropped before it is written | sensor silent, reading out of range | never stored |
+| `footfall` | a shop or office | counts per hour only, no addresses of rotating devices at all | none | counted, never stored |
+| `record` | evidence after a break-in | everything, raw payloads too, kept forever | none | kept forever |
+
+`home` is the default: today's behaviour plus phases 1 and 3, and it
+shows something on day one even without sensors. `record` is today's "keep
+everything" section of the README; its legal note moves to the mode.
+
+The keys a mode sets:
+
+| key | values | home | sensors | footfall | record |
+|---|---|---|---|---|---|
+| `keep` | `all`, `sensors`, `counts` | all | sensors | counts | all |
+| `payloads` | true, false | false | false | false | true |
+| `retention_days` | days, 0 = forever | 90 | 90 | 30 | 0 |
+| `forget_random_days` | days, 0 = never | 7 | 7 | 7 | 0 |
+| `alerts` | list of rules | silent, arrived, left | silent, range | none | none |
+
+What `keep` does in `record_cycle()`:
+
+- `all`: as today.
+- `sensors`: drops adverts that no decoder turned into a reading. The
+  cycle is still counted, so "silent" alerts still know the scanner was
+  running.
+- `counts`: rotating addresses are never written to `devices`. Their
+  device-cycles go straight into the existing "forgotten" pseudo-device's
+  hourly row, the same row `purge()` folds into today. So `btlog hours`
+  and the dashboard's all-device charts work unchanged, and no address of
+  a passer-by ever touches the disk.
+
+Config and NixOS:
+
+```toml
+mode = "sensors"
+retention_days = 365      # overrides the mode's 90
+notify = "https://ntfy.sh/my-shed-7f3a"
+```
+
+```nix
+services.btlog = { enable = true; mode = "sensors"; notify = "https://ntfy.sh/my-shed-7f3a"; };
+```
+
+## Phase 1: payloads, decoders, readings
+
+Today `advert_from()` keeps only the lowest company id. The new pieces:
+
+- **`Advert`** carries `manufacturer_data` and `service_data` as bytes
+  (bleak's `AdvertisementData` has both).
+- **`decoders.py`**: functions from (company id or service UUID, bytes) to
+  `{kind: value}`, for example `{"temperature": 21.4, "humidity": 48.0,
+  "battery": 87}`. A registry dict, one small function per format, and
+  each one is tested against the published sample payloads of its format.
+  - BTHome v2, unencrypted (service data 0xFCD2). An open format used by
+    Shelly BLU and many DIY sensors, so one decoder covers many devices.
+    Start here.
+  - Ruuvi RAWv2, data format 5 (manufacturer 0x0499). Well documented,
+    with test vectors.
+  - Xiaomi LYWSD03MMC with the pvvx/ATC custom firmware (service data
+    0x181A). The stock firmware encrypts its data, so it is out.
+  - Later, if asked for: Govee H5075, SwitchBot meters. Out: Victron
+    Instant Readout and encrypted BTHome, which need AES.
+- **Schema**, the same pattern as RSSI:
+
+  ```sql
+  CREATE TABLE readings (            -- raw, retention_days like sightings
+      ts REAL NOT NULL, device_id INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+      kind TEXT NOT NULL, value REAL NOT NULL,
+      PRIMARY KEY (device_id, kind, ts)) WITHOUT ROWID;
+  CREATE TABLE hourly_readings (     -- kept forever
+      device_id INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+      day TEXT NOT NULL, hour INTEGER NOT NULL, weekday INTEGER NOT NULL, kind TEXT NOT NULL,
+      n INTEGER NOT NULL, min REAL NOT NULL, max REAL NOT NULL, sum REAL NOT NULL,
+      PRIMARY KEY (device_id, kind, day, hour)) WITHOUT ROWID;
+  ```
+
+  A sensor with three kinds adds about 4,300 raw rows a day at a 60 s
+  interval: roughly 390,000 rows (about 15 MB) at 90 days. The rollup is
+  72 rows a day.
+- **`PRAGMA user_version`** gets its first use: version 1 is today's
+  schema, version 2 adds these tables. `Store.__init__` migrates forward
+  with `CREATE TABLE IF NOT EXISTS`.
+- **CLI**: `btlog readings DEVICE [--kind temperature] [--by hour|day]`
+  (min, average and max with a bar), and `btlog now`: what was heard in
+  the last cycle, with RSSI and latest readings.
+- **Dashboard**: a sensor panel, with one line of hourly averages per kind
+  and a min–max band.
+
+Roughly 400 lines with tests.
+
+## Phase 2: modes, `keep` and raw payloads
+
+- `config.py`: `mode`, `keep` and `payloads`. `MODES` is a dict of
+  defaults; `load()` starts from the mode and applies the file over it.
+  Unknown modes are an error, like unknown keys.
+- `record_cycle()` applies `keep` as described above.
+- With `payloads = true`, the exact bytes of every manufacturer and
+  service data field go into their own table, one row per device, cycle
+  and field (the last value heard in the cycle). Evidence then does not
+  depend on what the decoders understood, and a decoder written later can
+  be run over old data. Raw payloads follow `retention_days` and roughly
+  double the database in `record` mode.
+
+  ```sql
+  CREATE TABLE payloads (
+      ts REAL NOT NULL, device_id INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+      field TEXT NOT NULL,           -- 'm:004C' (company id) or 's:0000fcd2-...' (service UUID)
+      data BLOB NOT NULL,
+      PRIMARY KEY (device_id, ts, field)) WITHOUT ROWID;
+  ```
+
+  `btlog export --json` includes them as hex.
+- The module gets a `mode` enum option, and the README gets a "Modes"
+  section with the legal note per mode.
+- Tests: `keep = "counts"` never writes a rotating address, yet the
+  all-device hours are the same as with `all`; `keep = "sensors"` stores
+  only decoded devices but still counts the cycle.
+
+Roughly 200 lines with tests.
+
+## Phase 3: rules and notifications
+
+- **`rules.py`**: each rule is a function over the store that returns the
+  alerts that hold now.
+  - `silent`: a device with readings, or a labelled device, not heard for
+    N hours.
+  - `arrived` / `left`: a labelled device appears or disappears, with a
+    debounce of a few cycles so a weak signal does not flap.
+  - `range`: a reading outside the bounds set in the config file, per
+    device label. The config file, not the database, so that bounds are
+    declarative (a NixOS option) and the dashboard stays read-only:
+
+    ```toml
+    [range.freezer]
+    temperature = [-30, -15]
+    battery = [20, 100]
+    ```
+  - `unusual`: a known device in an hour of day where its presence over
+    the last 30 days is under 2 %.
+- **`alerts` table**: `(rule, device_id, opened, closed, sent)`. One
+  notification when an alert opens and one when it closes; no repeats.
+- **`notify`**: an `https://` URL gets a POST (ntfy takes the body as the
+  message; anything else gets JSON). A `command:` prefix runs a program
+  with the alert as JSON on stdin. That is all: email goes through a
+  command (`command:/usr/bin/mail -s btlog me@example.org`), so no mail
+  password ever sits in btlog's config.
+- **Where it runs**: not in the scanner. The scanner unit has no network
+  (`PrivateNetwork`) and should keep it that way. A separate
+  `btlog alerts` command evaluates the rules and sends. NixOS runs it from
+  a timer every few minutes, as the btlog user, with network allowed. The
+  only thing it writes is the `alerts` table, so it holds SQLite's write
+  lock for milliseconds.
+- **CLI**: `btlog alerts` (list open and recent), `btlog alerts --run`
+  (what the timer calls), `btlog alerts --test` (send one test
+  notification).
+- **API**: `/api/present` (labelled devices heard in the last N minutes)
+  and `/api/alerts`, for Home Assistant or a shell script.
+
+Roughly 350 lines with tests.
+
+## Footfall
+
+There is no phase of its own: phase 2's `keep = "counts"` plus a "busy"
+view (this week against the last four, per hour of day) on the existing
+all-device counts. The README must be honest about it: this is a proxy.
+Phones advertise more or less depending on make, settings and whether the
+screen is on, so it shows trends ("Saturdays are twice as busy as
+Tuesdays"), not head counts.
+
+## Size and testing
+
+Code grows from about 1,300 to about 2,250 lines; tests grow alongside.
+Everything stays testable without hardware: decoders against published
+payloads, the store and rules against in-memory databases, notifications
+against a local HTTP server on a free port, and the alerts timer as a
+plain function call. What only the bench can show: how often real sensors
+advertise, whether BlueZ passes service data through unchanged, and
+whether a paired phone really shows up under one address.
+
+## Decisions
+
+- **Default mode: `home`.** It works on day one without sensors. `sensors`
+  is one line away for anyone who wants nothing about strangers stored.
+- **Notifications: an https POST (ntfy or any webhook) and `command:`.**
+  Email goes through a command, which keeps mail credentials out of the
+  config.
+- **Raw payloads: stored in `record` mode only** (`payloads = true`), for
+  evidence and for re-decoding later.
+- **Range bounds: in the config file, per device label**, so they are
+  declarative and the dashboard stays read-only.
+- **Tracker detection: not in btlog.** It is the one feature that looks
+  for a specific kind of other people's devices, so it belongs in a tool of
+  its own, if it is built at all. Notes for that tool: Apple Find My
+  "offline finding" adverts (manufacturer 0x004C, type 0x12) mark a tag
+  away from its owner. Such a tag keeps one address for about a day, which
+  makes it detectable from a fixed place. The layout must be checked
+  against public research first. It would reuse btlog's decoders and
+  rules as a library.
