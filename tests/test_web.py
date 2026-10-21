@@ -1,4 +1,5 @@
 import json
+import socket
 import tempfile
 import threading
 import unittest
@@ -96,6 +97,29 @@ class WebTest(unittest.TestCase):
             except urllib.error.HTTPError as e:
                 self.assertEqual((host, e.code), (host, code))
                 e.close()
+
+    def test_own_and_configured_names(self):
+        own = socket.gethostname().lower()
+        self.assertEqual(web.host_names("127.0.0.1"), {"localhost", "127.0.0.1"})
+        wide = web.host_names("0.0.0.0", ["Bench.Tailnet-1.ts.net."])
+        self.assertLessEqual({own, own.split(".")[0] + ".local", "bench.tailnet-1.ts.net"}, wide)
+        self.assertNotIn("evil.example", wide)
+        # Configured names count on loopback too, case and trailing dot aside.
+        srv = web.make_server(self.srv.RequestHandlerClass.db, "127.0.0.1:0", ["bench.tailnet-1.ts.net"])
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            port = srv.server_address[1]
+            for host, code in [("BENCH.tailnet-1.ts.net.:8778", 200), (f"{own}:8778", 421)]:
+                req = urllib.request.Request(f"http://127.0.0.1:{port}/api/status", headers={"Host": host})
+                try:
+                    with urllib.request.urlopen(req) as r:
+                        self.assertEqual((host, r.status), (host, code))
+                except urllib.error.HTTPError as e:
+                    self.assertEqual((host, e.code), (host, code))
+                    e.close()
+        finally:
+            srv.shutdown()
+            srv.server_close()
 
     def test_bind_parsing(self):
         with self.assertRaises(ValueError):

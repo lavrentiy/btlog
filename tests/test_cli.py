@@ -217,8 +217,12 @@ class ConfigTest(unittest.TestCase):
                 config.load(p)
             p.write_text("retention_days = 0\nforget_random_days = 0\n", encoding="utf-8")
             self.assertEqual((config.load(p).retention_days, config.load(p).forget_random_days), (0, 0))
+            p.write_text('web_names = ["bench.tailnet-1.ts.net"]\n', encoding="utf-8")
+            self.assertEqual(config.load(p).web_names, ["bench.tailnet-1.ts.net"])
+            self.assertEqual(config.Config().web_names, [])
             for bad in ('interval = 0\n', 'interval = "60"\n', 'retention_days = -1\n',
-                        'adapter = 1\n', 'forget_random_days = true\n', 'web_bind = 8778\n'):
+                        'adapter = 1\n', 'forget_random_days = true\n', 'web_bind = 8778\n',
+                        'web_names = "bench"\n', 'web_names = [1]\n'):
                 p.write_text(bad, encoding="utf-8")
                 with self.assertRaises(ValueError, msg=bad):
                     config.load(p)

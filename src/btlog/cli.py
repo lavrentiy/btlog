@@ -253,7 +253,7 @@ def cmd_status(store, a, conf):
 
 def cmd_web(a, conf):
     from btlog.web import serve
-    serve(conf.db, a.bind or conf.web_bind)
+    serve(conf.db, a.bind or conf.web_bind, conf.web_names)
 
 
 def cmd_daemon(conf):

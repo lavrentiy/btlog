@@ -27,7 +27,8 @@ let
     retention_days = cfg.retentionDays;
     forget_random_days = cfg.forgetRandomDays;
     web_bind = cfg.web.bind;
-  } // lib.optionalAttrs (cfg.adapter != null) { adapter = cfg.adapter; });
+    web_names = cfg.web.names;
+  } //lib.optionalAttrs (cfg.adapter != null) { adapter = cfg.adapter; });
   hardening = {
     NoNewPrivileges = true;
     ProtectSystem = "strict";
@@ -94,6 +95,22 @@ in
       '';
     };
 
+    waitForTimeSync = lib.mkOption {
+      type = lib.types.bool;
+      default = false;
+      description = ''
+        Start scanning only once the clock is synchronized over the network,
+        by enabling systemd-time-wait-sync (for systemd-timesyncd, the NixOS
+        default). Worth it on a board without a battery-backed clock, where
+        cycles logged before NTP lands under the wrong hours for good. The
+        price: on a machine that never gets network, the daemon never starts,
+        and neither does anything else ordered after time-sync.target (timers
+        with OnCalendar= among them). To wait at most a while and then scan
+        anyway, also set
+        systemd.services.systemd-time-wait-sync.serviceConfig.TimeoutStartSec.
+      '';
+    };
+
     stateDir = lib.mkOption {
       type = lib.types.path;
       default = "/var/lib/btlog";
@@ -116,6 +133,19 @@ in
         SSH port forward or Tailscale) or bind it to a trusted network only.
       '';
     };
+
+    web.names = lib.mkOption {
+      type = lib.types.listOf lib.types.str;
+      default = [ ];
+      example = [ "bench.tailnet-1234.ts.net" ];
+      description = ''
+        Extra host names the dashboard answers to. It always answers to IP
+        addresses, localhost and, when bound beyond localhost, this machine's
+        hostname, FQDN and hostname.local; any other name gets a 421 so a web
+        page cannot rebind its own name to this machine. A Tailscale MagicDNS
+        name is the usual entry here.
+      '';
+    };
   };
 
   config = lib.mkIf cfg.enable {
@@ -130,13 +160,17 @@ in
     };
     users.groups.btlog = { };
 
+    # NixOS ships systemd-time-wait-sync but not enabled: add it and hook it
+    # into sysinit.target as its upstream [Install] section would.
+    systemd.additionalUpstreamSystemUnits = lib.mkIf cfg.waitForTimeSync [ "systemd-time-wait-sync.service" ];
+    systemd.services.systemd-time-wait-sync = lib.mkIf cfg.waitForTimeSync { wantedBy = [ "sysinit.target" ]; };
+
     systemd.services.btlog = {
       description = "Log of Bluetooth LE devices in proximity";
       wantedBy = [ "multi-user.target" ];
-      # time-sync: on a board without a clock, cycles logged before NTP lands
-      # under the wrong day and stay in the rollups forever.
+      # Ordering only: time-sync.target waits for NTP just when something
+      # delays it, which waitForTimeSync arranges. Consumers must not pull it in.
       after = [ "bluetooth.service" "time-sync.target" ];
-      wants = [ "time-sync.target" ];
       requires = [ "bluetooth.service" ];
       restartTriggers = [ configFile ];
       serviceConfig = hardening // {

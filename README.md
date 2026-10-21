@@ -97,9 +97,11 @@ served as JSON under `/api/` (`status`, `devices`, `hours`, `days`, `timeline`,
 
 The dashboard opens the database read-only and never writes. Device names come
 from strangers' advertisements, so the page escapes everything before it goes
-into HTML, and requests under a DNS name other than the bind address get a
-421, so a web page you happen to have open cannot rebind its name to
-127.0.0.1 and read when the house is empty. **It has no authentication.** Leave it on localhost and reach it over an SSH port forward
+into HTML. It answers to IP addresses, `localhost`, the bind address and,
+when bound beyond localhost, the machine's own hostname, FQDN and
+`hostname.local`; add other names (a Tailscale MagicDNS name) to `web_names`.
+Any other name gets a 421, so a web page you happen to have open cannot rebind
+its name to 127.0.0.1 and read when the house is empty. **It has no authentication.** Leave it on localhost and reach it over an SSH port forward
 (`ssh -L 8778:127.0.0.1:8778 bench`) or Tailscale, or bind it to a trusted
 network only.
 
@@ -115,6 +117,7 @@ adapter = "hci0"                 # default: the default adapter
 retention_days = 90              # raw sightings; 0 keeps them forever
 forget_random_days = 7           # rotating private addresses; 0 never forgets
 web_bind = "127.0.0.1:8778"
+web_names = []                   # extra Host names, e.g. ["bench.tailnet-1234.ts.net"]
 ```
 
 ## Database
@@ -185,6 +188,14 @@ dashboard). The daemon logs one summary line
 per hour; `BTLOG_DEBUG=1` in the environment logs every cycle. The dashboard is a second unit under the same user
 (SQLite's WAL needs readers to share the writer's `-shm` file) with the database
 opened read-only.
+
+On a board without a battery-backed clock (a Raspberry Pi, say), set
+`waitForTimeSync = true`: cycles logged before NTP has set the clock land under
+the wrong hours and stay in the rollups. The catch is the reverse case: a
+machine that never gets network then never starts scanning, and other units
+ordered after `time-sync.target` wait too. To cap the wait, also set
+`systemd.services.systemd-time-wait-sync.serviceConfig.TimeoutStartSec = "5min";`
+and scanning starts after five minutes either way.
 
 Other Linux distributions: `pip install .`, then run `btlog daemon` under
 systemd as a user that may use BlueZ. Windows and macOS: bleak scans there too,

@@ -16,6 +16,7 @@ cannot rebind its own name to 127.0.0.1 and read the API from the browser.
 import ipaddress
 import json
 import logging
+import socket
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
@@ -146,7 +147,7 @@ setInterval(refresh, 60000);
 
 class Handler(BaseHTTPRequestHandler):
     db = None
-    bind_host = ""
+    names = frozenset()  # see host_names()
     server_version = "btlog"
     timeout = 10  # a client that connects and says nothing does not pin a thread
 
@@ -155,11 +156,11 @@ class Handler(BaseHTTPRequestHandler):
 
     def host_ok(self):
         """True for a Host a browser sends when the user typed the address:
-        localhost, an IP literal, or the name the server was bound to. A
-        rebinding page arrives under its own DNS name, which is none of those."""
+        an IP literal or one of the names from host_names(). A rebinding page
+        arrives under its own DNS name, which is none of those."""
         host = self.headers.get("Host", "")
         name = host.split("]")[0] + "]" if host.startswith("[") else host.rsplit(":", 1)[0]
-        if name in ("localhost", self.bind_host):
+        if name.lower().rstrip(".") in self.names:
             return True
         try:
             ipaddress.ip_address(name.strip("[]"))
@@ -223,16 +224,34 @@ class Handler(BaseHTTPRequestHandler):
         self.reply(text.encode(), "text/plain; charset=utf-8", status)
 
 
-def make_server(db, bind):
+def host_names(bind_host, extra=()):
+    """The names the dashboard answers to besides IP literals: localhost, the
+    bind host and the extra ones from web_names (a Tailscale MagicDNS name,
+    say). Listening beyond loopback, it also answers to this machine's own
+    names: hostname, FQDN and hostname.local for mDNS. Exact names only:
+    accepting any name that resolves to this machine would let a rebinding
+    page back in, since its owner decides what it resolves to."""
+    names = {"localhost", bind_host, *extra}
+    try:
+        loopback = bind_host == "localhost" or ipaddress.ip_address(bind_host.strip("[]")).is_loopback
+    except ValueError:
+        loopback = False
+    if not loopback:
+        short = socket.gethostname()
+        names |= {short, socket.getfqdn(), short.split(".")[0] + ".local"}
+    return frozenset(n.lower().rstrip(".") for n in names if n)
+
+
+def make_server(db, bind, names=()):
     host, _, port = bind.rpartition(":")
     if not host or not port.isdigit():
         raise ValueError(f"bind must be HOST:PORT, not {bind!r}")
-    handler = type("Handler", (Handler,), {"db": db, "bind_host": host})
+    handler = type("Handler", (Handler,), {"db": db, "names": host_names(host, names)})
     return ThreadingHTTPServer((host, int(port)), handler)
 
 
-def serve(db, bind):
-    srv = make_server(db, bind)
+def serve(db, bind, names=()):
+    srv = make_server(db, bind, names)
     print(f"btlog web on http://{srv.server_address[0]}:{srv.server_address[1]} (read-only, no authentication)")
     try:
         srv.serve_forever()

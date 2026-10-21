@@ -26,6 +26,7 @@ class Config:
     retention_days: int = 90      # raw sightings; 0 keeps them forever (rollups always are)
     forget_random_days: int = 7   # private random addresses unseen this long are removed; 0 never
     web_bind: str = "127.0.0.1:8778"
+    web_names: list = field(default_factory=list)  # extra Host names for the dashboard, e.g. Tailscale's
 
 
 def load(path=None):
@@ -50,6 +51,9 @@ def load(path=None):
                 value > 0 if numbers[key] == "positive" else value >= 0)
             if not ok:
                 raise ValueError(f"config key {key} must be a number, {numbers[key]}")
+        elif key == "web_names":
+            if not (isinstance(value, list) and all(isinstance(n, str) for n in value)):
+                raise ValueError("config key web_names must be a list of strings")
         elif not isinstance(value, str):
             raise ValueError(f"config key {key} must be a string")
     if "db" in data:
