@@ -1,0 +1,181 @@
+"""`btlog web`: a read-only dashboard over the database, standard library only.
+
+One page: the devices on the left, and for the selected one (or all of them)
+presence by hour of day and by weekday, signal strength per day, and the new
+devices of the week. The same data is served as JSON under /api/.
+
+The server opens the database read-only, once per request: SQLite connections
+are per thread and ThreadingHTTPServer gives every request its own. There is no
+authentication; keep it on localhost or a trusted network.
+"""
+
+import json
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlsplit
+
+from btlog import trends, when
+from btlog.store import Store
+
+PAGE = """<!doctype html>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>btlog</title>
+<style>
+  :root { color-scheme: dark; --bg: #14171c; --fg: #d8dce3; --dim: #7d8590; --bar: #4c9be8; --sel: #263040; --line: #2a303a; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 14px/1.4 system-ui, sans-serif; }
+  header { padding: 10px 16px; border-bottom: 1px solid var(--line); display: flex; gap: 16px; align-items: baseline; flex-wrap: wrap; }
+  header b { font-size: 16px; } header span { color: var(--dim); }
+  main { display: grid; grid-template-columns: minmax(280px, 1fr) 2fr; gap: 0; min-height: calc(100vh - 44px); }
+  @media (max-width: 800px) { main { grid-template-columns: 1fr; } }
+  #list { border-right: 1px solid var(--line); overflow: auto; max-height: calc(100vh - 44px); }
+  #list div { padding: 6px 16px; cursor: pointer; border-bottom: 1px solid var(--line); }
+  #list div:hover { background: #1c2129; } #list div.sel { background: var(--sel); }
+  #list small, .dim { color: var(--dim); display: block; }
+  .mono { font-family: ui-monospace, monospace; }
+  section { padding: 12px 16px; } h2 { font-size: 14px; margin: 14px 0 6px; color: var(--dim); font-weight: normal; }
+  .chart { display: flex; align-items: flex-end; gap: 2px; height: 90px; }
+  .chart div { flex: 1; background: var(--bar); min-width: 4px; position: relative; }
+  .chart div.none { background: var(--line); height: 2px !important; }
+  .chart div:hover::after { content: attr(title); position: absolute; bottom: 100%; left: 0; background: var(--sel); padding: 2px 6px; white-space: nowrap; font-size: 12px; }
+  .labels { display: flex; gap: 2px; font-size: 11px; color: var(--dim); } .labels span { flex: 1; text-align: center; min-width: 4px; }
+  input { background: var(--sel); color: var(--fg); border: 1px solid var(--line); padding: 4px 8px; border-radius: 4px; }
+  table { border-collapse: collapse; } td { padding: 2px 10px 2px 0; }
+</style>
+<header><b>btlog</b><span id="status">loading</span>
+  <label>since <input id="since" value="30d" size="8"></label></header>
+<main>
+  <div id="list"></div>
+  <section>
+    <div id="title">All devices</div>
+    <h2 id="hourstitle">Presence by hour of day</h2><div class="chart" id="hours"></div><div class="labels" id="hourlabels"></div>
+    <h2>By weekday</h2><div class="chart" id="days"></div><div class="labels" id="daylabels"></div>
+    <div id="rssiwrap" hidden><h2>Signal per day (average dBm)</h2><div class="chart" id="rssi"></div><div class="labels" id="rssilabels"></div></div>
+    <h2>New devices in the last 7 days</h2><div id="new" class="mono"></div>
+  </section>
+</main>
+<script>
+const $ = s => document.querySelector(s);
+const api = (path, q) => fetch(path + '?' + new URLSearchParams(q)).then(r => r.ok ? r.json() : r.text().then(t => { throw t; }));
+let selected = null;
+const WD = ['Mon','Tue','Wed','Thu','Fri','Sat','Sun'];
+function chart(el, labels, values, fmt, lo, hi) {
+  const vals = values.filter(v => v != null);
+  lo = lo ?? 0; hi = hi ?? Math.max(...vals, 1e-9);
+  el.chart.innerHTML = values.map((v, i) => v == null ? `<div class="none" title="${labels[i]}: no data"></div>`
+    : `<div style="height:${Math.max(2, (v - lo) / (hi - lo) * 100)}%" title="${labels[i]}: ${fmt(v)}"></div>`).join('');
+  el.labels.innerHTML = labels.map((l, i) => `<span>${labels.length > 12 && i % 2 ? '' : l}</span>`).join('');
+}
+const pct = v => Math.round(v * 100) + '%', num = v => v.toFixed(1);
+async function load() {
+  const q = { since: $('#since').value }, dev = selected ? { ...q, device: selected } : q;
+  try {
+    const [hours, days] = await Promise.all([api('/api/hours', dev), api('/api/days', dev)]);
+    const fmt = selected ? pct : num;
+    chart({ chart: $('#hours'), labels: $('#hourlabels') }, [...Array(24).keys()].map(h => String(h).padStart(2, '0')), hours, fmt);
+    chart({ chart: $('#days'), labels: $('#daylabels') }, WD, days, fmt);
+    $('#hourstitle').textContent = selected ? 'Presence by hour of day (share of scan cycles)' : 'Devices heard per scan cycle, by hour of day';
+    if (selected) {
+      const r = await api('/api/rssi', dev);
+      chart({ chart: $('#rssi'), labels: $('#rssilabels') }, r.map(x => x.when.slice(5)), r.map(x => x.avg), v => v.toFixed(1) + ' dBm', -100, -30);
+    }
+    $('#rssiwrap').hidden = !selected;
+  } catch (e) { $('#status').textContent = 'error: ' + e; }
+}
+async function devices() {
+  const list = await api('/api/devices', {}), st = await api('/api/status', {});
+  $('#status').textContent = `${st.devices} devices (+${st.private} rotating private), ${st.cycles} scan cycles since ${st.first_day || '-'}, last ${st.last_cycle ? new Date(st.last_cycle * 1000).toLocaleString() : '-'}`;
+  const all = `<div class="${selected ? '' : 'sel'}" data-a="">All devices<small>average per scan cycle</small></div>`;
+  $('#list').innerHTML = all + list.map(d => `<div class="${selected === d.address ? 'sel' : ''}" data-a="${d.address}" data-t="${d.address} ${d.label || d.name || ''}">
+    <span class="mono">${d.address}</span> ${d.label || d.name || ''}<small>${d.kind}, ${d.hours} h, last ${new Date(d.last_seen * 1000).toLocaleString()}</small></div>`).join('');
+  const fresh = await api('/api/new', { since: '7d' });
+  $('#new').innerHTML = fresh.length ? '<table>' + fresh.map(d => `<tr><td>${d.address}</td><td>${d.label || d.name || ''}</td><td class="dim">${new Date(d.first_seen * 1000).toLocaleString()}</td></tr>`).join('') + '</table>' : '<span class="dim">none</span>';
+}
+$('#list').addEventListener('click', e => {
+  const row = e.target.closest('[data-a]'); if (!row) return;
+  selected = row.dataset.a || null;
+  $('#title').textContent = selected ? row.dataset.t : 'All devices';
+  document.querySelectorAll('#list div').forEach(d => d.classList.toggle('sel', (d.dataset.a || null) === selected));
+  load();
+});
+$('#since').addEventListener('change', load);
+devices().then(load);
+setInterval(() => { devices(); load(); }, 60000);
+</script>
+"""
+
+
+class Handler(BaseHTTPRequestHandler):
+    db = None
+    server_version = "btlog"
+
+    def log_message(self, *args):
+        pass
+
+    def do_GET(self):
+        url = urlsplit(self.path)
+        q = {k: v[-1] for k, v in parse_qs(url.query).items()}
+        try:
+            if url.path == "/":
+                return self.reply(PAGE.encode(), "text/html; charset=utf-8")
+            with Store(self.db, readonly=True) as store:
+                data = self.api(store, url.path, q)
+            if data is None:
+                return self.error(HTTPStatus.NOT_FOUND, "not found")
+            self.reply(json.dumps(data).encode(), "application/json")
+        except (ValueError, LookupError) as e:
+            self.error(HTTPStatus.BAD_REQUEST, f"bad request: {e}")
+
+    def api(self, store, path, q):
+        since = when.parse(q.get("since", "30d"))
+        did = store.find(q["device"])["id"] if q.get("device") else None
+        if path == "/api/status":
+            return store.status()
+        if path == "/api/devices":
+            return [_public(d) for d in store.devices(private=q.get("private") == "1")]
+        if path == "/api/hours":
+            return trends.hours(store, did, since)
+        if path == "/api/days":
+            return trends.weekdays(store, did, since)
+        if path == "/api/rssi":
+            if did is None:
+                raise ValueError("device required")
+            return trends.rssi(store, did, since, q.get("by", "day"))
+        if path == "/api/new":
+            if since is None:
+                raise ValueError("since required")
+            return [_public(d) for d in trends.new(store, since)]
+        return None
+
+    def reply(self, body, ctype, status=HTTPStatus.OK):
+        self.send_response(status)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def error(self, status, text):
+        self.reply(text.encode(), "text/plain; charset=utf-8", status)
+
+
+def _public(d):
+    return {k: v for k, v in d.items() if k != "id"}
+
+
+def make_server(db, bind):
+    host, _, port = bind.rpartition(":")
+    if not host or not port.isdigit():
+        raise ValueError(f"bind must be HOST:PORT, not {bind!r}")
+    handler = type("Handler", (Handler,), {"db": db})
+    return ThreadingHTTPServer((host, int(port)), handler)
+
+
+def serve(db, bind):
+    srv = make_server(db, bind)
+    print(f"btlog web on http://{srv.server_address[0]}:{srv.server_address[1]} (read-only, no authentication)")
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        srv.server_close()

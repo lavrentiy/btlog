@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "btlog"
+dynamic = ["version"]
+description = "Always-on log of Bluetooth LE devices in proximity, with trend analysis"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [{ name = "lavrentiy" }]
+# bleak is the one dependency: BlueZ over D-Bus on Linux, WinRT on Windows,
+# CoreBluetooth on macOS. Everything else is the standard library.
+dependencies = ["bleak>=0.21"]
+
+[project.scripts]
+btlog = "btlog.cli:main"
+
+[tool.setuptools.dynamic]
+version = { attr = "btlog.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
