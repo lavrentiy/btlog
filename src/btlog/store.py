@@ -13,6 +13,11 @@
              sightings after retention_days.
   hourly_readings  per sensor per kind per local hour: count, min, max and sum,
              kept forever like hourly.
+  payloads   with payloads on (the record mode): the raw bytes of each
+             manufacturer and service data field per device per cycle, so the
+             evidence does not depend on what the decoders understood and a
+             decoder written later can be run over old data. Deleted after
+             retention_days.
 
 Hours are local time, because "who is here at eight in the morning" is a local
 question; day and weekday are stored alongside so GROUP BY stays in SQL.
@@ -24,9 +29,10 @@ rows are folded into a single "forgotten" pseudo-device first, so the count of
 devices around per hour stays right after the address is gone.
 
 PRAGMA user_version says which tables exist: 1 (or 0, never set) is the schema
-without readings, 2 adds them. A writable Store migrates forward on open; a
-read-only one on an older file (the dashboard upgraded before the daemon was
-restarted) answers the reading queries with nothing rather than failing.
+without readings, 2 adds them, 3 adds payloads. A writable Store migrates
+forward on open; a read-only one on an older file (the dashboard upgraded
+before the daemon was restarted) answers the reading and payload queries with
+nothing rather than failing.
 """
 
 import os
@@ -94,11 +100,26 @@ CREATE TABLE IF NOT EXISTS hourly_readings (
     sum REAL NOT NULL,
     PRIMARY KEY (device_id, kind, day, hour)
 ) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS payloads (
+    ts REAL NOT NULL,
+    device_id INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+    field TEXT NOT NULL,            -- 'm:004C' (company id) or 's:0000fcd2-0000-1000-8000-00805f9b34fb' (service UUID)
+    data BLOB NOT NULL,             -- the last bytes heard in the cycle
+    PRIMARY KEY (device_id, ts, field)
+) WITHOUT ROWID;
 """
-VERSION = 2   # PRAGMA user_version of SCHEMA; see the module docstring
+VERSION = 3   # PRAGMA user_version of SCHEMA; see the module docstring
 
 PRIVATE_KINDS = ("rpa", "nrpa")
 FORGOTTEN = "forgotten"
+KEEP = ("all", "sensors", "counts")   # what record_cycle() writes; the mode's, see config
+
+# One device-cycle more on a device's hourly row; also how a rotating address
+# is counted on the forgotten pseudo-device's row with keep = "counts".
+HOURLY_ADD = """INSERT INTO hourly VALUES (?, ?, ?, ?, 1, ?, ?)
+                ON CONFLICT(device_id, day, hour) DO UPDATE SET
+                    cycles = cycles + 1, rssi_max = max(rssi_max, excluded.rssi_max),
+                    rssi_sum = rssi_sum + excluded.rssi_sum"""
 
 
 def address_kind(address, address_type=None):
@@ -194,7 +215,7 @@ class Store:
         # Read once: a reader lives for one command or one request, and the
         # tables it may query do not change under it.
         version = self.conn.execute("PRAGMA user_version").fetchone()[0]
-        self.has_readings = version >= 2
+        self.has_readings, self.has_payloads = version >= 2, version >= 3
         self.conn.row_factory = _row
         self.conn.execute("PRAGMA foreign_keys=ON")
         self.conn.create_function("fold", 1, _fold, deterministic=True)
@@ -210,30 +231,52 @@ class Store:
 
     # ---------- Writing ----------
 
-    def record_cycle(self, ts, adverts):
+    def record_cycle(self, ts, adverts, keep="all", payloads=False):
         """Store one scan cycle started at ts: one sighting per address with the
         strongest RSSI, and the hourly rollups and cycle count advanced, so the
         trends are always current and never need recomputing. A sensor gets one
         reading per kind, the last value heard in the cycle, rolled up the same
-        way. Returns the number of devices heard."""
+        way; with payloads, every device gets the last bytes of each of its
+        manufacturer and service data fields.
+
+        keep narrows what is written, before anything is. "sensors" drops the
+        devices no decoder got a reading from in this cycle. "counts" writes no
+        rotating private address at all: each one heard adds a device-cycle to
+        the forgotten pseudo-device's hourly row, the row purge() would fold it
+        into later anyway, so the all-device trends come out the same and no
+        passer-by's address touches the disk (nor its readings or payloads,
+        which mean nothing once folded). Either way the cycle is counted: the
+        scanner did run. Returns the number of devices recorded."""
+        if keep not in KEEP:
+            raise ValueError(f"keep must be one of {', '.join(KEEP)}, not {keep!r}")
         heard = {}
         for a in adverts:
             h = heard.get(a.address)
             if h is None:
                 h = heard[a.address] = {"rssi": a.rssi, "n": 0, "name": None, "mfr": None, "readings": {},
-                                        "kind": address_kind(a.address, a.address_type)}
+                                        "payloads": {}, "kind": address_kind(a.address, a.address_type)}
             h["n"] += 1
             h["rssi"] = max(h["rssi"], a.rssi)
             h["name"] = printable(a.name) or h["name"]
             h["mfr"] = a.manufacturer if a.manufacturer is not None else h["mfr"]
             h["readings"].update(decoders.decode(a.manufacturer_data, a.service_data))
+            if payloads:
+                h["payloads"].update({f"m:{c:04X}": bytes(d) for c, d in a.manufacturer_data.items()})
+                h["payloads"].update({f"s:{decoders.full_uuid(u)}": bytes(d) for u, d in a.service_data.items()})
+        if keep == "sensors":
+            heard = {address: h for address, h in heard.items() if h["readings"]}
         day, hour, weekday = local_hour(ts)
+        sink = None
         with self.conn:
             self.conn.execute(
                 """INSERT INTO cycles VALUES (?, ?, ?, 1, ?)
                    ON CONFLICT(day, hour) DO UPDATE SET count = count + 1, last_ts = max(last_ts, excluded.last_ts)""",
                 (day, hour, weekday, ts))
             for address, h in heard.items():
+                if keep == "counts" and h["kind"] in PRIVATE_KINDS:
+                    sink = self._sink(ts) if sink is None else sink
+                    self.conn.execute(HOURLY_ADD, (day, hour, weekday, sink, h["rssi"], h["rssi"]))
+                    continue
                 # A kind learned later replaces 'unknown' (a backend that did not
                 # say at first); a name or vendor, once known, is never unlearned.
                 self.conn.execute(
@@ -248,12 +291,9 @@ class Store:
                 did = self.conn.execute("SELECT id FROM devices WHERE address = ?", (address,)).fetchone()["id"]
                 self.conn.execute("INSERT OR REPLACE INTO sightings VALUES (?, ?, ?, ?)",
                                   (ts, did, h["rssi"], h["n"]))
-                self.conn.execute(
-                    """INSERT INTO hourly VALUES (?, ?, ?, ?, 1, ?, ?)
-                       ON CONFLICT(device_id, day, hour) DO UPDATE SET
-                           cycles = cycles + 1, rssi_max = max(rssi_max, excluded.rssi_max),
-                           rssi_sum = rssi_sum + excluded.rssi_sum""",
-                    (day, hour, weekday, did, h["rssi"], h["rssi"]))
+                self.conn.execute(HOURLY_ADD, (day, hour, weekday, did, h["rssi"], h["rssi"]))
+                for field, data in h["payloads"].items():
+                    self.conn.execute("INSERT OR REPLACE INTO payloads VALUES (?, ?, ?, ?)", (ts, did, field, data))
                 for kind, value in h["readings"].items():
                     self.conn.execute("INSERT OR REPLACE INTO readings VALUES (?, ?, ?, ?)", (ts, did, kind, value))
                     self.conn.execute(
@@ -263,6 +303,16 @@ class Store:
                                sum = sum + excluded.sum""",
                         (did, day, hour, weekday, kind, value, value, value))
         return len(heard)
+
+    def _sink(self, ts):
+        """Id of the "forgotten" pseudo-device that rotating addresses are
+        counted under, created on first use. Not a real device: lists, lookups
+        and forget() leave it out, only the all-device counts read it."""
+        self.conn.execute(
+            """INSERT INTO devices (address, kind, first_seen, last_seen, cycles)
+               VALUES (?, ?, ?, ?, 0) ON CONFLICT(address) DO NOTHING""",
+            (FORGOTTEN, FORGOTTEN, ts, ts))
+        return self.conn.execute("SELECT id FROM devices WHERE address = ?", (FORGOTTEN,)).fetchone()["id"]
 
     def set_label(self, address, label):
         with self.conn:
@@ -283,7 +333,7 @@ class Store:
 
     def purge(self, now, retention_days, forget_random_days):
         """Apply retention; returns (sightings deleted, random devices forgotten).
-        Raw readings go with the sightings of the same age. 0 for either means
+        Raw readings and payloads go with the sightings of the same age. 0 for either means
         keep forever: that is the "log everything" setting, so it must be an
         explicit no-op rather than "older than now". A forgotten address takes
         its readings along: folded together, strangers' readings mean nothing."""
@@ -293,13 +343,10 @@ class Store:
         with self.conn:
             sightings = self.conn.execute("DELETE FROM sightings WHERE ts < ?", (old,)).rowcount
             self.conn.execute("DELETE FROM readings WHERE ts < ?", (old,))
+            self.conn.execute("DELETE FROM payloads WHERE ts < ?", (old,))
             stale = ("kind IN (?, ?) AND last_seen < ?", (*PRIVATE_KINDS, unseen))
             if self.conn.execute(f"SELECT 1 FROM devices WHERE {stale[0]} LIMIT 1", stale[1]).fetchone():
-                self.conn.execute(
-                    """INSERT INTO devices (address, kind, first_seen, last_seen, cycles)
-                       VALUES (?, ?, ?, ?, 0) ON CONFLICT(address) DO NOTHING""",
-                    (FORGOTTEN, FORGOTTEN, now, now))
-                sink = self.conn.execute("SELECT id FROM devices WHERE address = ?", (FORGOTTEN,)).fetchone()["id"]
+                sink = self._sink(now)
                 self.conn.execute(
                     f"""INSERT INTO hourly
                         SELECT h.day, h.hour, h.weekday, ?, h.cycles, h.rssi_max, h.rssi_sum
@@ -369,8 +416,11 @@ class Store:
             raise LookupError(f"{text!r} matches {len(rows)} devices; use the full address")
         return {k: v for k, v in rows[0].items() if k != "exact"}
 
-    def sightings(self, since=None, until=None, device_id=None):
-        """Raw sightings, oldest first, with the device's address, kind, name and label."""
+    def sightings(self, since=None, until=None, device_id=None, payloads=False):
+        """Raw sightings, oldest first, with the device's address, kind, name and
+        label. With payloads, a sighting that has raw payloads stored also gets
+        "payloads": {field: hex}. Rows come one at a time either way, so an
+        export of months does not sit in memory."""
         where, args = ["1"], []
         if since is not None:
             where.append("s.ts >= ?")
@@ -381,10 +431,22 @@ class Store:
         if device_id is not None:
             where.append("s.device_id = ?")
             args.append(device_id)
-        return self.conn.execute(
-            f"""SELECT s.ts, d.address, d.kind, d.name, d.label, s.rssi, s.adverts
+        payloads = payloads and self.has_payloads
+        # The payloads of a sighting are one lookup on the table's primary key;
+        # fields never hold '=' or ' ', so a plain list of field=hex does.
+        extra = """, (SELECT group_concat(p.field || '=' || lower(hex(p.data)), ' ') FROM payloads p
+                      WHERE p.device_id = s.device_id AND p.ts = s.ts) AS payloads""" if payloads else ""
+        rows = self.conn.execute(
+            f"""SELECT s.ts, d.address, d.kind, d.name, d.label, s.rssi, s.adverts {extra}
                 FROM sightings s JOIN devices d ON d.id = s.device_id
                 WHERE {' AND '.join(where)} ORDER BY s.ts, d.address""", args)
+        if not payloads:
+            return rows
+
+        def parsed(r):
+            text = r.pop("payloads")
+            return r | {"payloads": dict(sorted(f.split("=") for f in text.split()))} if text else r
+        return map(parsed, rows)
 
     def now(self):
         """The latest scan cycle: when it ran and the devices it heard, strongest

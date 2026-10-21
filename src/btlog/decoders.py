@@ -110,6 +110,13 @@ MANUFACTURERS = {0x0499: ruuvi}
 SERVICES = {"0000fcd2" + SIG_BASE: bthome, "0000181a" + SIG_BASE: atc}
 
 
+def full_uuid(uuid):
+    """A service UUID in bleak's 128-bit lower-case spelling: a 16- or 32-bit
+    short one is put onto the Bluetooth base UUID, so one service has one name."""
+    uuid = uuid.lower()
+    return f"{uuid:0>8}{SIG_BASE}" if len(uuid) in (4, 8) else uuid
+
+
 def decode(manufacturer_data, service_data):
     """All readings found in one advertisement, {kind: value}, {} if none.
 
@@ -121,7 +128,7 @@ def decode(manufacturer_data, service_data):
         if company in MANUFACTURERS:
             out.update(MANUFACTURERS[company](bytes(data)))
     for uuid, data in service_data.items():
-        decoder = SERVICES.get(uuid)
+        decoder = SERVICES.get(full_uuid(uuid))
         if decoder:
             out.update(decoder(bytes(data)))
     if not 0 <= out.get("battery", 0) <= 100:

@@ -113,7 +113,7 @@ def run(source, store, conf, clock=time.time, sleep=time.sleep, retry=None):
             continue
         if adverts is None:
             return
-        n = store.record_cycle(started, adverts)
+        n = store.record_cycle(started, adverts, keep=conf.keep, payloads=conf.payloads)
         log.debug("cycle: %d adverts, %d devices", len(adverts), n)
         cycles += 1
         addresses.update(a.address for a in adverts)

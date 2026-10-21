@@ -137,7 +137,7 @@ class OldDatabaseTest(unittest.TestCase):
                 path = Path(tmp) / "btlog.db"
                 with Store(path) as old:
                     old.record_cycle(at(19, 8), adverts((WATCH, -60)))
-                    old.conn.executescript(f"DROP TABLE readings; DROP TABLE hourly_readings; "
+                    old.conn.executescript(f"DROP TABLE readings; DROP TABLE hourly_readings; DROP TABLE payloads; "
                                            f"PRAGMA user_version = {version};")
                 with Store(path, readonly=True) as r:
                     self.assertFalse(r.has_readings)

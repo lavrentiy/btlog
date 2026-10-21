@@ -60,6 +60,9 @@ class BTHomeTest(Readings):
         self.assertEqual(bthome("4002C4"), {})
         self.assertReadings(bthome("40016103BF"), {"battery": 97})
 
+    def test_short_uuid_key(self):
+        self.assertReadings(decode({}, {"FCD2": bytes.fromhex("400161")}), {"battery": 97})
+
 
 class RuuviTest(Readings):
     # The test vectors of https://docs.ruuvi.com/communication/bluetooth-advertisements/data-format-5-rawv2

@@ -19,10 +19,11 @@ database and the same config file. Python 3.11+, one dependency
 | **Scans** | Every `interval` seconds (60 by default) it listens for BLE advertisements and records one sighting per device: time, address, address kind, name, manufacturer id, strongest RSSI, number of reports from the Bluetooth stack. |
 | **Rolls up** | Each sighting also advances a per-device, per-local-hour rollup and a count of scan cycles per hour. Trends read the rollups, so they are instant and survive the raw data being purged. |
 | **Measures against uptime** | Presence is a share of the scan cycles that actually ran in that hour, not of the wall clock: a day the scanner was off does not look like a day nobody was home. |
-| **Forgets rotating addresses** | Phones and watches change their random address every few minutes. Such an address unseen for `forget_random_days` (7) is removed; only its contribution to "how many devices per hour" is kept, under one anonymous pseudo-device. |
-| **Keeps raw data a while** | Raw sightings are kept `retention_days` (90) for CSV export and debugging. Hourly rollups are tiny and kept forever. |
+| **Forgets rotating addresses** | Phones and watches change their random address every few minutes. Such an address unseen for `forget_random_days` (7 by default) is removed; only its contribution to "how many devices per hour" is kept, under one anonymous pseudo-device. |
+| **Keeps raw data a while** | Raw sightings are kept `retention_days` (90 by default) for CSV export and debugging. Hourly rollups are tiny and kept forever. |
 | **Names things** | A device without a name is still shown by vendor (Apple, Garmin, Samsung...) from its manufacturer data, and you can label any device (`btlog name`). |
 | **Reads sensors** | Thermometers and the like that put their readings in their advertisements (BTHome, Ruuvi, Xiaomi on custom firmware) are decoded as they are heard: temperature, humidity, battery and more, with the same hourly rollups. See [Sensors](#sensors). |
+| **Modes** | One line sets it up for a job: `home` (the default), `sensors` (nothing about strangers stored), `footfall` (rotating addresses only counted) or `record` (everything, raw payloads too, kept forever). See [Modes](#modes). |
 | **CLI** | `devices`, `show`, `hours`, `days`, `heat`, `rssi`, `readings`, `now`, `new`, `top`, `name`, `export`, `status`; bars in a terminal, `--json` for scripts. |
 | **Web** | `btlog web`: devices, presence by hour and weekday, a day-by-hour heatmap, signal and sensor readings per day, new devices on one page, standard library only. |
 
@@ -43,7 +44,7 @@ btlog new --since 1d                   # devices seen for the first time since y
 btlog top --since 7d                   # devices around the most
 btlog forget "neighbour's tv"          # remove one device and everything recorded about it
 btlog export --since 2d > sightings.csv
-btlog export --since 2h --json
+btlog export --since 2h --json         # with the raw payloads as hex, where they are stored
 btlog export --since 2026-10-01 --until 2026-11-01 > october.csv
 btlog backup /mnt/nas/btlog-$(date +%F).db   # consistent copy, safe while the daemon writes
 btlog status --check                   # exit 1 when the daemon has not scanned for 3 intervals
@@ -140,20 +141,91 @@ its name to 127.0.0.1 and read when the house is empty. **It has no authenticati
 (`ssh -L 8778:127.0.0.1:8778 bench`) or Tailscale, or bind it to a trusted
 network only.
 
+## Modes
+
+A mode sets btlog up for one job. It is a named set of defaults for a few
+config keys, not a separate code path: `mode = "sensors"` means the same as
+writing the keys it implies, and any of those keys written in the config file
+beats the mode's value.
+
+| mode | for | stores | rotating addresses |
+|---|---|---|---|
+| `home` (default) | your place | every device, sensor readings; raw rows for 90 days | counted, forgotten after 7 days |
+| `sensors` | a shed, a van, a greenhouse | decoded sensors only; everything else is dropped before it is written | not stored (unless one is a sensor) |
+| `footfall` | a shop or office | devices with a fixed address as in `home`, rotating ones only as a count per hour; raw rows for 30 days | counted, never stored |
+| `record` | evidence after a break-in | everything, raw payloads too, kept forever | kept forever |
+
+The keys a mode sets:
+
+| key | values | home | sensors | footfall | record |
+|---|---|---|---|---|---|
+| `keep` | `all`, `sensors`, `counts` | all | sensors | counts | all |
+| `payloads` | true, false | false | false | false | true |
+| `retention_days` | days, 0 = forever | 90 | 90 | 30 | 0 |
+| `forget_random_days` | days, 0 = never | 7 | 7 | 7 | 0 |
+| `alerts` | list of rule names | silent, away | silent, range | none | none |
+
+`keep = "sensors"` drops every device that no decoder got a reading from in
+that scan cycle, before anything is written; the cycle itself still counts,
+so presence stays measured against uptime. `keep = "counts"` never writes a
+rotating private address: each one heard adds to the per-hour count of the
+anonymous pseudo-device that `forget_random_days` folds old addresses into
+anyway, so `btlog hours` and the dashboard's all-device charts come out the
+same as with `all` (its readings, meaningless once anonymous, are dropped).
+`payloads = true` stores the exact bytes of every manufacturer and service
+data field, the last ones heard per device and cycle, so evidence does not
+depend on what the decoders understood and a decoder written later can be run
+over old data; `btlog export --json` gives them as hex, and they roughly
+double the database. `alerts` names the alert rules for `btlog alerts`, which
+is still to come (see docs/roadmap.md); nothing reads it yet.
+
+What a mode means for other people's devices:
+
+- **home**: the neighbours' and passers-by's devices are logged with yours;
+  rotating addresses go after a week, fixed ones (headphones, cars, beacons)
+  stay until you `btlog forget` them.
+- **sensors**: nothing about other people's devices is stored, unless one
+  happens to be a sensor that btlog decodes.
+- **footfall**: no visitor's rotating address touches the disk, but the count
+  is a proxy. Phones advertise more or less depending on make, settings and
+  whether the screen is on, so it shows trends ("Saturdays are twice as busy
+  as Tuesdays"), not head counts. And not every device rotates: headphones,
+  fitness bands and cars often keep one address, and those are stored by
+  address for 30 days, as in `home`.
+- **record**: a log to hand over after a break-in, with
+  `btlog export --since 2026-10-17 --until 2026-10-18 --json` as the output
+  (raw payloads included), `sha256sum` on the file as the seal, and
+  `btlog backup` for the nightly copy (a plain file copy of a database in WAL
+  mode can tear). The CSV form is for people and spreadsheets: a name that
+  starts like a formula gets a leading apostrophe there, so prefer `--json`
+  for the sealed copy. Know what you are getting: a rotating address still
+  cannot be tied to a person without that person's device, a signal strength
+  does not say inside or outside, and logging the devices of everyone who
+  walks past, forever, is processing their personal data, which in the EU
+  needs a legal basis, a retention limit and a notice, as CCTV does. btlog
+  gives you the log; the rest is yours.
+
 ## Configuration
 
 `/etc/btlog.toml` (what the NixOS module writes), or `$BTLOG_CONFIG`, or
-`--config`; every key has a default:
+`--config`. Every key has a default; `mode` sets some of them (see
+[Modes](#modes)), and a key written here beats the mode:
 
 ```toml
+mode = "sensors"                 # home (default), sensors, footfall or record
 db = "/var/lib/btlog/btlog.db"   # default ~/.local/state/btlog/btlog.db
 interval = 60                    # seconds per scan cycle
 adapter = "hci0"                 # default: the default adapter
-retention_days = 90              # raw sightings; 0 keeps them forever
-forget_random_days = 7           # rotating private addresses; 0 never forgets
+retention_days = 365             # overrides the mode's 90; 0 keeps raw rows forever
+# forget_random_days = 7         # the mode's; rotating private addresses, 0 never forgets
+# keep = "sensors"               # the mode's: all, sensors or counts
+# payloads = false               # the mode's; true stores the raw advertisement bytes too
+# alerts = ["silent", "range"]   # the mode's rule names; nothing reads them yet
 web_bind = "127.0.0.1:8778"
 web_names = []                   # extra Host names, e.g. ["bench.tailnet-1234.ts.net"]
 ```
+
+`btlog status` shows the mode in effect.
 
 ## Database
 
@@ -167,37 +239,17 @@ SQLite, WAL mode so the CLI and the dashboard read while the daemon writes.
 | `cycles` | local hour: scan cycles the daemon ran | forever |
 | `readings` | sensor, kind and scan cycle: the value heard | `retention_days` |
 | `hourly_readings` | sensor, kind and local hour: count, min, max and sum | forever |
+| `payloads` | device, scan cycle and field (`m:004C` company id, `s:` + service UUID): the raw bytes, with `payloads = true` only | `retention_days` |
 
 Hours are local time, because "who is here at eight in the morning" is a local
-question. `PRAGMA user_version` is the schema version (2 since readings); the
-daemon migrates the file when it starts, and a dashboard or CLI that meets an
-older file shows no readings until then. Privacy: the database is readable by the `btlog` user only
+question. `PRAGMA user_version` is the schema version (2 since readings, 3
+since raw payloads); the daemon migrates the file when it starts, and a
+dashboard or CLI that meets an older file shows no readings or payloads until
+then. Privacy: the database is readable by the `btlog` user only
 (`/var/lib/btlog`, mode 0750); `forget_random_days` bounds how long a rotating
 address is kept; `btlog forget` removes one device, `btlog export` takes data
 out, and deleting the database file starts over. Advertised names are stored
 with control characters stripped, so a hostile name cannot drive your terminal.
-
-### Keeping everything
-
-The defaults are for watching your own place: raw data ages out, rotating
-addresses are forgotten. Both knobs accept `0` for "never":
-
-```toml
-retention_days = 0        # keep every raw sighting
-forget_random_days = 0    # never remove rotating private addresses
-```
-
-That is the whole change for a shop that wants a log to hand over after a
-break-in, with `btlog export --since 2026-10-17 --until 2026-10-18 --json` as
-the output, `sha256sum` on the file as the seal, and `btlog backup` for the
-nightly copy (a plain file copy of a database in WAL mode can tear). The CSV
-form is for people and spreadsheets: a name that starts like a formula gets a
-leading apostrophe there, so prefer `--json` for the sealed copy. Know what you are getting: a rotating
-address still cannot be tied to a person without that person's device, a
-signal strength does not say inside or outside, and logging the devices of
-everyone who walks past is processing their personal data, which in the EU
-needs a legal basis, a retention limit and a notice, as CCTV does. btlog gives
-you the log; the rest is yours.
 
 ## NixOS
 
@@ -211,13 +263,17 @@ btlog.nixosModules.default
 {
   services.btlog = {
     enable = true;
+    mode = "home";           # or sensors, footfall, record; see Modes
     interval = 60;
-    retentionDays = 90;
-    forgetRandomDays = 7;
+    # retentionDays = 365;   # left unset: the mode's 90
     web.enable = true;       # dashboard on http://127.0.0.1:8778, no authentication
   };
 }
 ```
+
+`retentionDays`, `forgetRandomDays` and `payloads` default to `null`, which
+leaves them to the mode; set one and it wins over the mode, as in the config
+file.
 
 The module enables `hardware.bluetooth` and runs the scanner as its own `btlog`
 user with a hardened systemd unit that has no network at all (`PrivateNetwork`),

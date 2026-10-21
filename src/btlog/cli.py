@@ -13,10 +13,10 @@ Bluetooth LE devices in proximity, and answers questions about the trends.
   btlog top [--since 7d]           devices around the most
   btlog name DEVICE LABEL          label a device ("" removes the label)
   btlog forget DEVICE              remove one device and everything recorded about it
-  btlog export [--since 1d]        raw sightings as CSV (or JSON with --json)
+  btlog export [--since 1d]        raw sightings as CSV (or JSON with --json, raw payloads included)
   btlog backup FILE                consistent copy of the database
   btlog purge                      apply retention now (the daemon does it hourly)
-  btlog status [--check]           database size and the last scan cycle (--check: exit 1 if stale)
+  btlog status [--check]           mode, database size and the last scan cycle (--check: exit 1 if stale)
   btlog web                        read-only dashboard on http://127.0.0.1:8778 (no authentication)
   btlog daemon                     the scanner itself (runs as a service)
 
@@ -251,9 +251,10 @@ def csv_text(text):
 def cmd_export(store, a):
     """Sightings as CSV: unix seconds and local time, so the hour that repeats
     when daylight saving ends is still unambiguous. --json gives the rows as
-    they are, for a sealed copy."""
+    they are, for a sealed copy, with the raw payloads as hex where they were
+    stored (payloads = true); the CSV stays one fixed set of columns."""
     did = store.find(a.device)["id"] if a.device else None
-    rows = store.sightings(*period(a), device_id=did)
+    rows = store.sightings(*period(a), device_id=did, payloads=a.json)
     if a.json:
         return print(json.dumps([dict(s) for s in rows], indent=2))
     out = csv.writer(sys.stdout, lineterminator="\n")
@@ -278,8 +279,10 @@ def cmd_status(store, a, conf):
     s = store.status()
     stale = s["last_cycle"] is None or time.time() - s["last_cycle"] > 3 * conf.interval
     size = sum(os.path.getsize(f) for f in (str(conf.db), f"{conf.db}-wal") if os.path.exists(f))
-    emit(a, {**s, "stale": stale, "bytes": size}, "\n".join([
+    mode = {"mode": conf.mode, "keep": conf.keep, "payloads": conf.payloads}
+    emit(a, {**s, "stale": stale, "bytes": size, **mode}, "\n".join([
         f"database   {conf.db} ({size / 1e6:.1f} MB)",
+        f"mode       {conf.mode} (keep {conf.keep}" + (", raw payloads" if conf.payloads else "") + ")",
         f"devices    {s['devices']} (plus {s['private']} rotating private addresses)",
         f"sightings  {s['sightings']} (kept {conf.retention_days or 'ever'} days)",
         f"cycles     {s['cycles']} since {s['first_day'] or '-'}",
@@ -300,7 +303,8 @@ def cmd_daemon(conf):
     # fine: BlueZ stops a client's discovery when its D-Bus connection closes.
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     with Store(conf.db) as store:
-        logging.getLogger("btlog").info("scanning every %gs into %s", conf.interval, conf.db)
+        logging.getLogger("btlog").info("scanning every %gs into %s, mode %s (keep %s%s)", conf.interval, conf.db,
+                                        conf.mode, conf.keep, ", raw payloads" if conf.payloads else "")
         run(BleakSource(conf.adapter), store, conf)
 
 

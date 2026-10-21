@@ -2,11 +2,16 @@
 #
 #   services.btlog = {
 #     enable = true;
+#     mode = "home";             # home, sensors, footfall or record: a set of defaults
 #     interval = 60;             # seconds per scan cycle
-#     retentionDays = 90;        # raw sightings; 0 = forever (hourly rollups always are)
-#     forgetRandomDays = 7;      # drop rotating private addresses unseen this long; 0 = never
+#     retentionDays = 365;       # raw rows; 0 = forever (hourly rollups always are); null = the mode's
+#     forgetRandomDays = 7;      # drop rotating private addresses unseen this long; 0 = never; null = the mode's
 #     web.enable = true;         # read-only dashboard on http://127.0.0.1:8778
 #   };
+#
+# Only options that are set land in /etc/btlog.toml next to the mode: a key
+# written there beats the mode, so an option with a default of its own would
+# quietly undo the mode's (record mode's 0 for "keep forever", say).
 #
 # The scanner needs a Bluetooth adapter managed by BlueZ (hardware.bluetooth
 # is enabled by this module) and nothing else: it talks to BlueZ over the
@@ -23,12 +28,16 @@ let
   toml = pkgs.formats.toml { };
   configFile = toml.generate "btlog.toml" ({
     db = "${cfg.stateDir}/btlog.db";
+    mode = cfg.mode;
     interval = cfg.interval;
-    retention_days = cfg.retentionDays;
-    forget_random_days = cfg.forgetRandomDays;
     web_bind = cfg.web.bind;
     web_names = cfg.web.names;
-  } //lib.optionalAttrs (cfg.adapter != null) { adapter = cfg.adapter; });
+  } // lib.filterAttrs (_: v: v != null) {
+    adapter = cfg.adapter;
+    retention_days = cfg.retentionDays;
+    forget_random_days = cfg.forgetRandomDays;
+    payloads = cfg.payloads;
+  });
   hardening = {
     NoNewPrivileges = true;
     ProtectSystem = "strict";
@@ -79,19 +88,51 @@ in
       description = "Adapter to scan with; null is the default adapter.";
     };
 
+    mode = lib.mkOption {
+      type = lib.types.enum [ "home" "sensors" "footfall" "record" ];
+      default = "home";
+      description = ''
+        What btlog is set up for; each mode is a set of defaults for the
+        options below that are left at null. home: every device, raw data for
+        90 days, rotating addresses forgotten after 7. sensors: decoded sensors
+        only, everything else is dropped before it is written. footfall:
+        rotating addresses only counted per hour, never stored; raw data for
+        30 days. record: everything kept forever, raw payloads too, which in
+        most places makes you responsible for other people's personal data
+        (see the README's Modes section).
+      '';
+    };
+
     retentionDays = lib.mkOption {
-      type = lib.types.ints.unsigned;
-      default = 90;
-      description = "How long raw sightings are kept; 0 keeps them forever. Hourly rollups are kept forever.";
+      type = lib.types.nullOr lib.types.ints.unsigned;
+      default = null;
+      example = 365;
+      description = ''
+        How long raw sightings, readings and payloads are kept; 0 keeps them
+        forever. Hourly rollups are kept forever. null: the mode's default
+        (90 days; 30 in footfall mode, forever in record mode).
+      '';
     };
 
     forgetRandomDays = lib.mkOption {
-      type = lib.types.ints.unsigned;
-      default = 7;
+      type = lib.types.nullOr lib.types.ints.unsigned;
+      default = null;
+      example = 7;
       description = ''
         Rotating private addresses not seen for this many days are removed from
         the database, keeping only their contribution to the per-hour counts.
-        0 never removes them.
+        0 never removes them. null: the mode's default (7; never in record mode).
+      '';
+    };
+
+    payloads = lib.mkOption {
+      type = lib.types.nullOr lib.types.bool;
+      default = null;
+      description = ''
+        Also store the raw manufacturer and service data bytes of every
+        device, per scan cycle, for evidence and for decoding later; they
+        follow retentionDays and roughly double the database. null: the
+        mode's default (true in record mode only).
       '';
     };
 

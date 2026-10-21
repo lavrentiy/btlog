@@ -6,9 +6,9 @@ import unittest
 from types import SimpleNamespace as NS
 
 from btlog.config import Config
-from btlog.scanner import BleakSource, advert_from, run
+from btlog.scanner import Advert, BleakSource, advert_from, run
 from btlog.store import Store
-from helpers import PHONE, WATCH, Clock, ScriptedSource, adverts, at
+from helpers import BEACON, BTHOME, PHONE, SENSOR, WATCH, Clock, ScriptedSource, adverts, at, thermometer
 
 
 class FakeScanner:
@@ -105,6 +105,14 @@ class RunTest(unittest.TestCase):
         self.assertEqual((s["cycles"], s["devices"], s["private"], s["sightings"]), (3, 1, 1, 3))
         self.assertEqual(self.store.find(WATCH)["cycles"], 2)
         self.assertEqual([x["ts"] for x in self.store.sightings()], [at(19, 8), at(19, 8, 2), at(19, 8, 2)])
+
+    def test_keep_and_payloads_come_from_the_config(self):
+        tag = Advert(BEACON, -60, "public", manufacturer_data={0x004C: b"\x02"})
+        source = ScriptedSource([[*adverts((WATCH, -60), (PHONE, -70)), tag, thermometer(20.0)]])
+        clock = Clock(at(19, 8))
+        run(source, self.store, Config(keep="sensors", payloads=True), clock=clock, sleep=clock.sleep)
+        self.assertEqual([d["address"] for d in self.store.devices(private=True)], [SENSOR])
+        self.assertEqual([r["payloads"] for r in self.store.sightings(payloads=True)], [{"s:" + BTHOME: "4002d007"}])
 
     def test_scan_failure_is_retried_not_fatal(self):
         source = ScriptedSource([OSError("adapter gone"), adverts((WATCH, -60))])
