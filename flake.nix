@@ -1,5 +1,5 @@
 {
-  description = "btlog: always-on log of Bluetooth LE devices in proximity, with trends";
+  description = "btlog: a bluesitting daemon, logging Bluetooth LE devices in proximity, with trends";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
 

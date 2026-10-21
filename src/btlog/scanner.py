@@ -25,20 +25,41 @@ class Advert:
     services: tuple = ()
 
 
+def advert_from(device, adv):
+    """An Advert from bleak's (BLEDevice, AdvertisementData), or None.
+
+    On BlueZ bleak also calls back for property changes that are not adverts
+    (a paired keyboard connecting, say), and those carry no RSSI; bleak fills
+    in -127. Such a report is not a sighting and is dropped. The lowest company
+    id is taken when a device carries several, so the vendor does not flip
+    from cycle to cycle with dictionary order.
+    """
+    details = getattr(device, "details", None)
+    props = details.get("props", {}) if isinstance(details, dict) else {}
+    if adv.rssi is None or (props and "RSSI" not in props):
+        return None
+    return Advert(
+        address=device.address.upper(), rssi=adv.rssi,
+        address_type=props.get("AddressType"), name=adv.local_name,
+        manufacturer=min(adv.manufacturer_data) if adv.manufacturer_data else None,
+        services=tuple(adv.service_uuids))
+
+
 class BleakSource:
     """Advertisements from the local adapter, through bleak.
 
-    Discovery is started afresh every cycle rather than left running: BlueZ only
-    reports a device again when something about it changes, so a device that
-    just sits there would otherwise be heard once and never again. Stopping and
-    starting discovery makes BlueZ announce everything in range each cycle.
+    One event loop lives for the whole daemon: bleak keeps its connection to
+    BlueZ per loop, so a loop per cycle would reconnect to D-Bus and re-read
+    every known device each minute. Discovery itself is started afresh each
+    cycle, which has BlueZ report everything in range again.
     """
 
     def __init__(self, adapter=None):
         self.adapter = adapter
+        self.loop = asyncio.new_event_loop()
 
     def scan(self, seconds):
-        return asyncio.run(self._scan(seconds))
+        return self.loop.run_until_complete(self._scan(seconds))
 
     async def _scan(self, seconds):
         from bleak import BleakScanner
@@ -46,13 +67,9 @@ class BleakSource:
         heard = []
 
         def on_advert(device, adv):
-            props = getattr(device, "details", None)
-            props = props.get("props", {}) if isinstance(props, dict) else {}
-            heard.append(Advert(
-                address=device.address.upper(), rssi=adv.rssi,
-                address_type=props.get("AddressType"), name=adv.local_name,
-                manufacturer=next(iter(adv.manufacturer_data), None),
-                services=tuple(adv.service_uuids)))
+            a = advert_from(device, adv)
+            if a is not None:
+                heard.append(a)
 
         kwargs = {"adapter": self.adapter} if self.adapter else {}
         async with BleakScanner(on_advert, **kwargs):
@@ -65,13 +82,21 @@ def run(source, store, conf, clock=time.time, sleep=time.sleep, retry=None):
 
     A failing scan (adapter unplugged, BlueZ restarting) is logged and retried
     after one interval rather than taking the service down: systemd would restart
-    it anyway, and the gap shows in the cycles table either way. Retention is
-    applied once an hour from inside the loop, so there is no second timer.
+    it anyway, and the gap shows in the cycles table either way. Every hour the
+    loop logs a one-line summary and applies retention, so there is no second
+    timer; single cycles are logged at debug level only, to spare the journal.
     """
     retry = conf.interval if retry is None else retry
-    next_purge = 0
+    next_hour, cycles, addresses = 0, 0, set()
     while True:
         started = clock()
+        if started >= next_hour:
+            if next_hour:
+                log.info("last hour: %d cycles, %d distinct addresses", cycles, len(addresses))
+            sightings, devices = store.purge(started, conf.retention_days, conf.forget_random_days)
+            if sightings or devices:
+                log.info("purged %d old sightings, forgot %d random addresses", sightings, devices)
+            next_hour, cycles, addresses = started + 3600, 0, set()
         try:
             adverts = source.scan(conf.interval)
         except Exception as e:  # noqa: BLE001 - anything from the Bluetooth stack
@@ -81,9 +106,6 @@ def run(source, store, conf, clock=time.time, sleep=time.sleep, retry=None):
         if adverts is None:
             return
         n = store.record_cycle(started, adverts)
-        log.info("cycle: %d adverts, %d devices", len(adverts), n)
-        if started >= next_purge:
-            sightings, devices = store.purge(started, conf.retention_days, conf.forget_random_days)
-            if sightings or devices:
-                log.info("purged %d old sightings, forgot %d random addresses", sightings, devices)
-            next_purge = started + 3600
+        log.debug("cycle: %d adverts, %d devices", len(adverts), n)
+        cycles += 1
+        addresses.update(a.address for a in adverts)

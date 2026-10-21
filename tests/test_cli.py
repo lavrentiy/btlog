@@ -24,11 +24,19 @@ class CliTest(unittest.TestCase):
     def tearDownClass(cls):
         cls.tmp.cleanup()
 
-    def run_cli(self, *args):
+    def run_cli(self, *args, db=None):
         out, err = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-            code = cli.main(["--db", str(self.db), *args])
+            code = cli.main(["--db", str(db or self.db), *args])
         return code or 0, out.getvalue(), err.getvalue()
+
+    def other_db(self, *cycles):
+        """A database of its own for tests that write, so the shared one keeps its counts."""
+        path = Path(self.tmp.name) / f"{self._testMethodName}.db"
+        with Store(path) as store:
+            for ts, advs in cycles:
+                store.record_cycle(ts, advs)
+        return path
 
     def test_devices_table_and_json(self):
         code, out, _ = self.run_cli("devices")
@@ -58,12 +66,24 @@ class CliTest(unittest.TestCase):
         self.assertEqual(json.loads(out)[7:9], [None, 1.0])
 
     def test_days_show_rssi_new_top(self):
-        for args in (["days"], ["show", "garmin"], ["rssi", WATCH, "--by", "hour", "--since", "all"], ["new", "--since", "all"], ["top"]):
+        for args in (["days"], ["show", "garmin"], ["rssi", WATCH, "--by", "hour", "--since", "all"], ["new", "--since", "2026-10-01"], ["top"]):
             code, out, err = self.run_cli(*args)
             self.assertEqual((code, err), (0, ""), args)
             self.assertTrue(out.strip(), args)
         _, out, _ = self.run_cli("show", "garmin")
-        self.assertIn("manufacturer id 135", out)
+        self.assertIn("vendor Garmin", out)
+        _, out, _ = self.run_cli("--json", "devices")
+        self.assertEqual([d["vendor"] for d in json.loads(out)], ["Garmin", ""])
+
+    def test_heat_calendar(self):
+        code, out, err = self.run_cli("heat", "garmin", "--since", "all")
+        self.assertEqual((code, err), (0, ""))
+        lines = out.splitlines()
+        self.assertEqual(lines[1], "            0  3  6  9  12 15 18 21 ")
+        self.assertEqual(lines[2], "2026-10-19        ███" + " " * 15)
+        self.assertEqual(lines[3], "2026-10-20  ········█···············")
+        code, out, _ = self.run_cli("--json", "heat", "--since", "2026-10-20")
+        self.assertEqual(json.loads(out), [{"day": "2026-10-20", "hour": 8, "presence": 2.0}])
         _, out, _ = self.run_cli("--json", "new", "--since", "2026-10-20")
         self.assertEqual(json.loads(out), [])
         _, out, _ = self.run_cli("--json", "top", "-n", "1", "--since", "all")
@@ -83,13 +103,46 @@ class CliTest(unittest.TestCase):
     def test_export_csv(self):
         _, out, _ = self.run_cli("export", "--since", "all", "-d", "garmin")
         rows = out.splitlines()
-        self.assertEqual(rows[0], "time,address,kind,name,label,rssi,adverts")
+        self.assertEqual(rows[0], "ts,time,address,kind,name,label,rssi,adverts")
         self.assertEqual(len(rows), 1 + 18 + 1)
-        self.assertTrue(rows[-1].startswith(f"2026-10-20 08:00:00,{WATCH},static,Garmin,,-55,1"))
+        self.assertEqual(rows[-1], f"{int(at(20, 8))},2026-10-20 08:00:00,{WATCH},static,Garmin,,-55,1")
+        _, out, _ = self.run_cli("export", "--since", "2026-10-20", "--json")
+        self.assertEqual(json.loads(out)[0]["address"], PHONE)
+
+    def test_global_flags_after_the_subcommand(self):
+        _, out, _ = self.run_cli("devices", "--json")
+        self.assertEqual(json.loads(out)[0]["address"], WATCH)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertFalse(cli.main(["devices", "--db", str(self.db), "--json"]))
+        self.assertEqual(json.loads(out.getvalue())[0]["address"], WATCH)
+
+    def test_since_cuts_at_the_hour(self):
+        _, out, _ = self.run_cli("--json", "hours", "garmin", "--since", "2026-10-19T12:00")
+        data = json.loads(out)
+        self.assertEqual((data[7], data[8], data[12]), (None, 1.0, 0.0))
+
+    def test_forget(self):
+        db = self.other_db((at(21, 8), adverts(("DE:AD:BE:EF:00:01", -60, "Neighbour"), (WATCH, -60))))
+        code, out, _ = self.run_cli("forget", "neigh", db=db)
+        self.assertEqual((code, out), (0, "DE:AD:BE:EF:00:01 Neighbour forgotten, with 1 sightings\n"))
+        code, _, err = self.run_cli("show", "neigh", db=db)
+        self.assertEqual(code, 1)
+        _, out, _ = self.run_cli("--json", "status", db=db)
+        self.assertEqual((json.loads(out)["devices"], json.loads(out)["cycles"]), (1, 1))
+
+    def test_names_are_printable(self):
+        db = self.other_db((at(21, 9), adverts(("DE:AD:BE:EF:00:02", -60, "evil\x1b[2J\nname"))))
+        _, out, _ = self.run_cli("--json", "show", "DE:AD:BE:EF:00:02", db=db)
+        self.assertEqual(json.loads(out)["name"], "evil[2Jname")
 
     def test_status_and_purge(self):
         _, out, _ = self.run_cli("--json", "status")
-        self.assertEqual(json.loads(out)["cycles"], 145)
+        s = json.loads(out)
+        self.assertEqual((s["cycles"], s["last_cycle"], s["stale"]), (145, at(20, 8), True))
+        code, out, _ = self.run_cli("status", "--check")
+        self.assertEqual(code, 1)
+        self.assertIn("stale: is the daemon running?", out)
         code, out, _ = self.run_cli("purge")
         self.assertEqual(code, 0)
         self.assertIn("deleted 0 sightings", out)
@@ -117,9 +170,11 @@ class ConfigTest(unittest.TestCase):
             p.write_text("intervall = 30\n", encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "intervall"):
                 config.load(p)
-            p.write_text("interval = 0\n", encoding="utf-8")
-            with self.assertRaises(ValueError):
-                config.load(p)
+            for bad in ('interval = 0\n', 'interval = "60"\n', 'retention_days = 1.5\n', 'adapter = 1\n',
+                        'forget_random_days = true\n'):
+                p.write_text(bad, encoding="utf-8")
+                with self.assertRaises(ValueError, msg=bad):
+                    config.load(p)
             with self.assertRaises(FileNotFoundError):
                 config.load(Path(tmp) / "nope.toml")
             os.environ["BTLOG_CONFIG"] = str(Path(tmp) / "nope.toml")
@@ -138,9 +193,8 @@ class WhenTest(unittest.TestCase):
         self.assertEqual(when.parse("yesterday", now), at(18, 0))
         self.assertEqual(when.parse("2026-10-18T19:30", now), at(18, 19, 30))
         self.assertIsNone(when.parse("all", now))
-        self.assertEqual(when.day(now), "2026-10-19")
-        self.assertEqual(when.day(None), "")
         self.assertEqual(when.fmt(now), "2026-10-19 10:30")
+        self.assertEqual(when.fmt(None), "-")
         with self.assertRaises(ValueError):
             when.parse("soon", now)
 

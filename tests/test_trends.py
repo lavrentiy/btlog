@@ -1,6 +1,6 @@
 import unittest
 
-from btlog import trends
+from btlog import trends, vendors
 from btlog.store import Store
 from helpers import BEACON, PHONE, WATCH, adverts, at, days_in_week, fill_day
 
@@ -44,10 +44,22 @@ class PresenceTest(unittest.TestCase):
         self.assertEqual(trends.hours(self.store, self.watch)[13], 0.5)
         self.assertEqual(trends.hours(self.store, self.watch, since=at(20, 0))[13], 1.0)
 
+    def test_since_cuts_at_the_hour_not_the_day(self):
+        h = trends.hours(self.store, self.watch, since=at(19, 12, 30))
+        self.assertEqual((h[7], h[11], h[12], h[18]), (None, None, 0.0, 1.0))
+        self.assertEqual(len(trends.timeline(self.store, self.watch, since=at(19, 12, 30))), 12)
+        self.assertEqual(trends.rssi(self.store, self.watch, since=at(19, 18)), [{"when": "2026-10-19", "max": -60, "avg": -60.0}])
+        top = trends.busiest(self.store, since=at(19, 9))
+        self.assertEqual([(d["address"], d["cycles_heard"]) for d in top], [(BEACON, 90), (WATCH, 36)])
+        self.assertEqual(trends.busiest(self.store)[1]["cycles_heard"], 54)
+
     def test_timeline_includes_absent_hours(self):
         t = trends.timeline(self.store, self.watch, since=at(19, 0))
         self.assertEqual(len(t), 24)
         self.assertEqual([r["presence"] for r in t[5:9]], [0.0, 1.0, 1.0, 1.0])
+        everyone = trends.timeline(self.store, since=at(19, 0))
+        self.assertEqual([r["presence"] for r in everyone[5:9]], [1.0, 2.0, 2.0, 2.0])
+        self.assertEqual(everyone[12]["presence"], 1.0)
 
 
 class WeekdayTest(unittest.TestCase):
@@ -63,6 +75,13 @@ class WeekdayTest(unittest.TestCase):
         self.assertEqual(w[0], 1.0)
         self.assertEqual(w[1], 0.5)
         self.assertEqual(w[2:], [None] * 5)
+
+
+class VendorTest(unittest.TestCase):
+    def test_names(self):
+        self.assertEqual(vendors.name(0x004C), "Apple")
+        self.assertEqual(vendors.name(0x1234), "0x1234")
+        self.assertEqual(vendors.name(None), "")
 
 
 class RssiAndNewTest(unittest.TestCase):

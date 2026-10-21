@@ -36,13 +36,24 @@ let
     PrivateDevices = true;
     ProtectKernelTunables = true;
     ProtectKernelModules = true;
+    ProtectKernelLogs = true;
     ProtectControlGroups = true;
+    ProtectClock = true;
+    ProtectHostname = true;
+    ProtectProc = "invisible";
     RestrictNamespaces = true;
+    RestrictRealtime = true;
+    RestrictSUIDSGID = true;
     LockPersonality = true;
     MemoryDenyWriteExecute = true;
     SystemCallArchitectures = "native";
+    SystemCallFilter = [ "@system-service" "~@privileged" ];
     CapabilityBoundingSet = "";
+    UMask = "0077";
   };
+  # systemd creates the state directory only under /var/lib; elsewhere the
+  # directory has to exist already.
+  stateDirectory = lib.mkIf (lib.hasPrefix "/var/lib/" cfg.stateDir) (lib.removePrefix "/var/lib/" cfg.stateDir);
 in
 {
   options.services.btlog = {
@@ -130,11 +141,12 @@ in
         Group = "btlog";
         Restart = "always";
         RestartSec = 5;
-        StateDirectory = lib.mkIf (cfg.stateDir == "/var/lib/btlog") "btlog";
+        StateDirectory = stateDirectory;
         StateDirectoryMode = "0750";
         ReadWritePaths = [ cfg.stateDir ];
-        # Only the system D-Bus socket; no network at all.
+        # Only the system D-Bus socket, which is a path, not a network address.
         RestrictAddressFamilies = [ "AF_UNIX" ];
+        PrivateNetwork = true;
       };
     };
 
@@ -145,6 +157,7 @@ in
       description = "btlog web dashboard (read-only, no authentication)";
       wantedBy = [ "multi-user.target" ];
       after = [ "network.target" "btlog.service" ];
+      wants = [ "btlog.service" ];
       restartTriggers = [ configFile ];
       serviceConfig = hardening // {
         ExecStart = "${lib.getExe cfg.package} web --bind ${lib.escapeShellArg cfg.web.bind}";
@@ -152,6 +165,7 @@ in
         Group = "btlog";
         Restart = "always";
         RestartSec = 5;
+        StateDirectory = stateDirectory;
         ReadWritePaths = [ cfg.stateDir ];
         RestrictAddressFamilies = [ "AF_INET" "AF_INET6" "AF_UNIX" ];
       };

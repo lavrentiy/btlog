@@ -22,7 +22,7 @@ python3Packages.buildPythonApplication {
   pythonImportsCheck = [ "btlog.cli" ];
 
   meta = {
-    description = "Always-on log of Bluetooth LE devices in proximity, with trend analysis";
+    description = "Bluesitting daemon: always-on log of Bluetooth LE devices in proximity, with trends";
     license = lib.licenses.mit;
     mainProgram = "btlog";
     platforms = lib.platforms.linux;

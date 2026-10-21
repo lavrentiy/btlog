@@ -41,9 +41,14 @@ def load(path=None):
     unknown = sorted(set(data) - known)
     if unknown:
         raise ValueError(f"unknown config key(s): {', '.join(unknown)}")
+    # TOML has types, so "60" (a string) is a mistake worth stopping on now
+    # rather than an hour later inside the purge.
+    for key, kinds in {"interval": (int, float), "retention_days": (int,), "forget_random_days": (int,),
+                       "adapter": (str, type(None)), "web_bind": (str,), "db": (str,)}.items():
+        if key in data and (not isinstance(data[key], kinds) or isinstance(data[key], bool)):
+            raise ValueError(f"config key {key} must be {' or '.join(k.__name__ for k in kinds)}")
+        if key in data and kinds[0] in (int, float) and data[key] <= 0:
+            raise ValueError(f"config key {key} must be positive")
     if "db" in data:
         data["db"] = Path(data["db"]).expanduser()
-    conf = Config(**data)
-    if conf.interval <= 0:
-        raise ValueError("interval must be positive")
-    return conf
+    return Config(**data)

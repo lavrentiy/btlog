@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "btlog"
 dynamic = ["version"]
-description = "Always-on log of Bluetooth LE devices in proximity, with trend analysis"
+description = "Bluesitting daemon: an always-on log of Bluetooth LE devices in proximity, with trend analysis"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"

@@ -1,8 +1,10 @@
 """`btlog web`: a read-only dashboard over the database, standard library only.
 
 One page: the devices on the left, and for the selected one (or all of them)
-presence by hour of day and by weekday, signal strength per day, and the new
-devices of the week. The same data is served as JSON under /api/.
+presence by hour of day and by weekday, a day-by-hour heatmap, signal strength
+per day, and the new devices of the week. The same data is served as JSON
+under /api/. Device names come from strangers' advertisements, so the page
+escapes everything it puts into HTML.
 
 The server opens the database read-only, once per request: SQLite connections
 are per thread and ThreadingHTTPServer gives every request its own. There is no
@@ -10,14 +12,17 @@ authentication; keep it on localhost or a trusted network.
 """
 
 import json
+import logging
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
-from btlog import trends, when
+from btlog import trends, vendors, when
 from btlog.store import Store
 
-PAGE = """<!doctype html>
+log = logging.getLogger("btlog")
+
+PAGE ="""<!doctype html>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>btlog</title>
 <style>
@@ -40,6 +45,10 @@ PAGE = """<!doctype html>
   .labels { display: flex; gap: 2px; font-size: 11px; color: var(--dim); } .labels span { flex: 1; text-align: center; min-width: 4px; }
   input { background: var(--sel); color: var(--fg); border: 1px solid var(--line); padding: 4px 8px; border-radius: 4px; }
   table { border-collapse: collapse; } td { padding: 2px 10px 2px 0; }
+  .heat { display: grid; grid-template-columns: 5em repeat(24, 1fr); gap: 2px; font-size: 11px; color: var(--dim); }
+  .heat i { display: block; height: 14px; background: var(--bar); border-radius: 2px; }
+  .heat i.none { background: var(--line); opacity: 1; }
+  .heat span { text-align: center; }
 </style>
 <header><b>btlog</b><span id="status">loading</span>
   <label>since <input id="since" value="30d" size="8"></label></header>
@@ -49,30 +58,47 @@ PAGE = """<!doctype html>
     <div id="title">All devices</div>
     <h2 id="hourstitle">Presence by hour of day</h2><div class="chart" id="hours"></div><div class="labels" id="hourlabels"></div>
     <h2>By weekday</h2><div class="chart" id="days"></div><div class="labels" id="daylabels"></div>
+    <h2 id="heattitle">Day by hour</h2><div class="heat" id="heat"></div>
     <div id="rssiwrap" hidden><h2>Signal per day (average dBm)</h2><div class="chart" id="rssi"></div><div class="labels" id="rssilabels"></div></div>
     <h2>New devices in the last 7 days</h2><div id="new" class="mono"></div>
   </section>
 </main>
 <script>
 const $ = s => document.querySelector(s);
+// Names and labels come from BLE advertisements, i.e. from strangers: never raw HTML.
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const api = (path, q) => fetch(path + '?' + new URLSearchParams(q)).then(r => r.ok ? r.json() : r.text().then(t => { throw t; }));
+const name = d => esc(d.label || d.name || (d.vendor && d.vendor + ' device') || '');
 let selected = null;
 const WD = ['Mon','Tue','Wed','Thu','Fri','Sat','Sun'];
 function chart(el, labels, values, fmt, lo, hi) {
   const vals = values.filter(v => v != null);
-  lo = lo ?? 0; hi = hi ?? Math.max(...vals, 1e-9);
+  lo = lo ?? 0; hi = hi ?? vals.reduce((m, v) => Math.max(m, v), 1e-9);
   el.chart.innerHTML = values.map((v, i) => v == null ? `<div class="none" title="${labels[i]}: no data"></div>`
     : `<div style="height:${Math.max(2, (v - lo) / (hi - lo) * 100)}%" title="${labels[i]}: ${fmt(v)}"></div>`).join('');
   el.labels.innerHTML = labels.map((l, i) => `<span>${labels.length > 12 && i % 2 ? '' : l}</span>`).join('');
 }
 const pct = v => Math.round(v * 100) + '%', num = v => v.toFixed(1);
+function heat(rows, fmt) {
+  const days = new Map();
+  rows.forEach(r => { if (!days.has(r.day)) days.set(r.day, Array(24).fill(null)); days.get(r.day)[r.hour] = r.presence; });
+  const hi = selected ? 1 : rows.reduce((m, r) => Math.max(m, r.presence), 1e-9);
+  let html = '<span></span>' + [...Array(24).keys()].map(h => `<span>${h % 3 ? '' : String(h).padStart(2, '0')}</span>`).join('');
+  for (const [day, cells] of days) html += `<span>${day.slice(5)}</span>` + cells.map((v, h) => v == null
+    ? `<i class="none" title="${day} ${h}h: scanner off"></i>` : `<i style="opacity:${0.08 + 0.92 * v / hi}" title="${day} ${h}h: ${fmt(v)}"></i>`).join('');
+  $('#heat').innerHTML = html;
+  $('#heattitle').textContent = selected ? 'Day by hour (share of scan cycles)' : `Day by hour (devices per scan cycle, full = ${hi.toFixed(1)})`;
+}
 async function load() {
   const q = { since: $('#since').value }, dev = selected ? { ...q, device: selected } : q;
   try {
-    const [hours, days] = await Promise.all([api('/api/hours', dev), api('/api/days', dev)]);
+    const [hours, days, rows] = await Promise.all([api('/api/hours', dev), api('/api/days', dev), api('/api/timeline', dev)]);
     const fmt = selected ? pct : num;
-    chart({ chart: $('#hours'), labels: $('#hourlabels') }, [...Array(24).keys()].map(h => String(h).padStart(2, '0')), hours, fmt);
-    chart({ chart: $('#days'), labels: $('#daylabels') }, WD, days, fmt);
+    // A device's presence is a share, drawn against 100%; counts against their maximum.
+    const hi = selected ? 1 : undefined;
+    chart({ chart: $('#hours'), labels: $('#hourlabels') }, [...Array(24).keys()].map(h => String(h).padStart(2, '0')), hours, fmt, 0, hi);
+    chart({ chart: $('#days'), labels: $('#daylabels') }, WD, days, fmt, 0, hi);
+    heat(rows, fmt);
     $('#hourstitle').textContent = selected ? 'Presence by hour of day (share of scan cycles)' : 'Devices heard per scan cycle, by hour of day';
     if (selected) {
       const r = await api('/api/rssi', dev);
@@ -85,10 +111,10 @@ async function devices() {
   const list = await api('/api/devices', {}), st = await api('/api/status', {});
   $('#status').textContent = `${st.devices} devices (+${st.private} rotating private), ${st.cycles} scan cycles since ${st.first_day || '-'}, last ${st.last_cycle ? new Date(st.last_cycle * 1000).toLocaleString() : '-'}`;
   const all = `<div class="${selected ? '' : 'sel'}" data-a="">All devices<small>average per scan cycle</small></div>`;
-  $('#list').innerHTML = all + list.map(d => `<div class="${selected === d.address ? 'sel' : ''}" data-a="${d.address}" data-t="${d.address} ${d.label || d.name || ''}">
-    <span class="mono">${d.address}</span> ${d.label || d.name || ''}<small>${d.kind}, ${d.hours} h, last ${new Date(d.last_seen * 1000).toLocaleString()}</small></div>`).join('');
+  $('#list').innerHTML = all + list.map(d => `<div class="${selected === d.address ? 'sel' : ''}" data-a="${esc(d.address)}" data-t="${esc(d.address)} ${name(d)}">
+    <span class="mono">${esc(d.address)}</span> ${name(d)}<small>${esc(d.kind)}${d.vendor ? ', ' + esc(d.vendor) : ''}, ${d.hours} h, last ${new Date(d.last_seen * 1000).toLocaleString()}</small></div>`).join('');
   const fresh = await api('/api/new', { since: '7d' });
-  $('#new').innerHTML = fresh.length ? '<table>' + fresh.map(d => `<tr><td>${d.address}</td><td>${d.label || d.name || ''}</td><td class="dim">${new Date(d.first_seen * 1000).toLocaleString()}</td></tr>`).join('') + '</table>' : '<span class="dim">none</span>';
+  $('#new').innerHTML = fresh.length ? '<table>' + fresh.map(d => `<tr><td>${esc(d.address)}</td><td>${name(d)}</td><td class="dim">${new Date(d.first_seen * 1000).toLocaleString()}</td></tr>`).join('') + '</table>' : '<span class="dim">none</span>';
 }
 $('#list').addEventListener('click', e => {
   const row = e.target.closest('[data-a]'); if (!row) return;
@@ -107,6 +133,7 @@ setInterval(() => { devices(); load(); }, 60000);
 class Handler(BaseHTTPRequestHandler):
     db = None
     server_version = "btlog"
+    timeout = 10  # a client that connects and says nothing does not pin a thread
 
     def log_message(self, *args):
         pass
@@ -124,6 +151,9 @@ class Handler(BaseHTTPRequestHandler):
             self.reply(json.dumps(data).encode(), "application/json")
         except (ValueError, LookupError) as e:
             self.error(HTTPStatus.BAD_REQUEST, f"bad request: {e}")
+        except Exception as e:  # noqa: BLE001 - a locked or missing database, absurd input
+            log.error("%s %s: %s", self.command, self.path, e)
+            self.error(HTTPStatus.INTERNAL_SERVER_ERROR, f"error: {e}")
 
     def api(self, store, path, q):
         since = when.parse(q.get("since", "30d"))
@@ -136,6 +166,8 @@ class Handler(BaseHTTPRequestHandler):
             return trends.hours(store, did, since)
         if path == "/api/days":
             return trends.weekdays(store, did, since)
+        if path == "/api/timeline":
+            return trends.timeline(store, did, since)
         if path == "/api/rssi":
             if did is None:
                 raise ValueError("device required")
@@ -151,6 +183,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
         self.wfile.write(body)
 
@@ -159,7 +192,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def _public(d):
-    return {k: v for k, v in d.items() if k != "id"}
+    return {k: v for k, v in d.items() if k != "id"} | {"vendor": vendors.name(d["manufacturer"])}
 
 
 def make_server(db, bind):

@@ -1,8 +1,8 @@
 """Times on the command line: '30m', '2h', '3d', 'today', 'yesterday',
 '2026-10-18', '2026-10-18T19:30' or 'all'.
 
-parse() gives unix seconds, the unit the sightings use (None for 'all'); day()
-turns that into the local 'YYYY-MM-DD' the rollup tables are keyed on.
+parse() gives unix seconds, the unit the sightings use (None for 'all');
+fmt() prints them as local time for tables.
 """
 
 import re
@@ -37,11 +37,6 @@ def parse(text, now=None):
 
 def midnight(dt):
     return datetime.combine(dt.date(), time())
-
-
-def day(ts):
-    """Local 'YYYY-MM-DD' of unix seconds; '' (before every day) for None."""
-    return "" if ts is None else datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
 
 
 def fmt(ts, seconds=False):

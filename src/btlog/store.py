@@ -58,6 +58,7 @@ CREATE TABLE IF NOT EXISTS cycles (
     hour INTEGER NOT NULL,
     weekday INTEGER NOT NULL,
     count INTEGER NOT NULL,
+    last_ts REAL NOT NULL,          -- start of the latest cycle in this hour
     PRIMARY KEY (day, hour)
 ) WITHOUT ROWID;
 """
@@ -89,6 +90,24 @@ def local_hour(ts):
     """(day 'YYYY-MM-DD', hour, weekday) of a unix time in the machine's zone."""
     dt = datetime.fromtimestamp(ts)
     return dt.strftime("%Y-%m-%d"), dt.hour, dt.weekday()
+
+
+def after(since, table=""):
+    """SQL condition and parameters for rollup rows at or after since, to the
+    hour. The rollups are keyed on (day, hour), so '--since 2h' must not pull
+    in the whole of today. None (for 'all') matches everything."""
+    if since is None:
+        return "1", ()
+    day, hour, _ = local_hour(since)
+    t = f"{table}." if table else ""
+    return f"({t}day > ? OR ({t}day = ? AND {t}hour >= ?))", (day, day, hour)
+
+
+def printable(text):
+    """A device name with control characters removed. Names come from strangers'
+    advertisements and go to terminals, so an escape sequence that clears the
+    screen or retitles the window must not get through."""
+    return "".join(c for c in text if c.isprintable()) or None if text else None
 
 
 def _row(cursor, row):
@@ -137,19 +156,23 @@ class Store:
                                         "kind": address_kind(a.address, a.address_type)}
             h["n"] += 1
             h["rssi"] = max(h["rssi"], a.rssi)
-            h["name"] = a.name or h["name"]
+            h["name"] = printable(a.name) or h["name"]
             h["mfr"] = a.manufacturer if a.manufacturer is not None else h["mfr"]
         day, hour, weekday = local_hour(ts)
         with self.conn:
             self.conn.execute(
-                "INSERT INTO cycles VALUES (?, ?, ?, 1) ON CONFLICT(day, hour) DO UPDATE SET count = count + 1",
-                (day, hour, weekday))
+                """INSERT INTO cycles VALUES (?, ?, ?, 1, ?)
+                   ON CONFLICT(day, hour) DO UPDATE SET count = count + 1, last_ts = max(last_ts, excluded.last_ts)""",
+                (day, hour, weekday, ts))
             for address, h in heard.items():
+                # A kind learned later replaces 'unknown' (a backend that did not
+                # say at first); a name or vendor, once known, is never unlearned.
                 self.conn.execute(
                     """INSERT INTO devices (address, kind, name, manufacturer, first_seen, last_seen, cycles)
                        VALUES (?, ?, ?, ?, ?, ?, 1)
                        ON CONFLICT(address) DO UPDATE SET
                            last_seen = excluded.last_seen, cycles = cycles + 1,
+                           kind = CASE WHEN kind = 'unknown' THEN excluded.kind ELSE kind END,
                            name = COALESCE(excluded.name, name),
                            manufacturer = COALESCE(excluded.manufacturer, manufacturer)""",
                     (address, h["kind"], h["name"], h["mfr"], ts, ts))
@@ -168,6 +191,16 @@ class Store:
         with self.conn:
             n = self.conn.execute("UPDATE devices SET label = ? WHERE address = ?",
                                   (label or None, address)).rowcount
+        if not n:
+            raise LookupError(f"no device {address}")
+
+    def forget(self, address):
+        """Remove one device with all its sightings and rollups (the cycle counts
+        stay, the scanner did run). For the neighbour's thing you do not want in
+        your database, without starting over."""
+        with self.conn:
+            n = self.conn.execute("DELETE FROM devices WHERE address = ? AND kind != ?",
+                                  (address, FORGOTTEN)).rowcount
         if not n:
             raise LookupError(f"no device {address}")
 
@@ -260,6 +293,6 @@ class Store:
             "private": one("SELECT COUNT(*) AS n FROM devices WHERE kind IN ('rpa', 'nrpa')")["n"],
             "sightings": one("SELECT COUNT(*) AS n FROM sightings")["n"],
             "cycles": one("SELECT COALESCE(SUM(count), 0) AS n FROM cycles")["n"],
-            "last_cycle": one("SELECT MAX(ts) AS t FROM sightings")["t"],
+            "last_cycle": one("SELECT MAX(last_ts) AS t FROM cycles")["t"],
             "first_day": one("SELECT MIN(day) AS d FROM cycles")["d"],
         }

@@ -1,10 +1,34 @@
 import logging
 import unittest
+from types import SimpleNamespace as NS
 
 from btlog.config import Config
-from btlog.scanner import run
+from btlog.scanner import advert_from, run
 from btlog.store import Store
 from helpers import PHONE, WATCH, Clock, ScriptedSource, adverts, at
+
+
+class AdvertFromTest(unittest.TestCase):
+    """What bleak hands over, as fakes: BLEDevice(address, details) and
+    AdvertisementData(rssi, local_name, manufacturer_data, service_uuids)."""
+
+    def adv(self, rssi=-60, name="Watch", mfr=None, uuids=()):
+        return NS(rssi=rssi, local_name=name, manufacturer_data=mfr or {}, service_uuids=list(uuids))
+
+    def test_bluez_device(self):
+        dev = NS(address="c0:aa:bb:cc:dd:ee", details={"path": "/org/bluez/hci0/dev_C0", "props": {"AddressType": "random", "RSSI": -60}})
+        a = advert_from(dev, self.adv(mfr={0x004C: b"\x01", 0x0006: b"\x02"}, uuids=["180d"]))
+        self.assertEqual((a.address, a.rssi, a.address_type, a.name, a.manufacturer, a.services),
+                         ("C0:AA:BB:CC:DD:EE", -60, "random", "Watch", 0x0006, ("180d",)))
+
+    def test_other_backend_has_no_address_type(self):
+        a = advert_from(NS(address="C0:AA:BB:CC:DD:EE", details=object()), self.adv(name=None))
+        self.assertEqual((a.address_type, a.name, a.manufacturer), (None, None, None))
+
+    def test_property_change_without_rssi_is_not_a_sighting(self):
+        dev = NS(address="C0:AA:BB:CC:DD:EE", details={"path": "x", "props": {"Connected": True}})
+        self.assertIsNone(advert_from(dev, self.adv(rssi=-127)))
+        self.assertIsNone(advert_from(NS(address="C0:AA:BB:CC:DD:EE", details=None), self.adv(rssi=None)))
 
 
 class RunTest(unittest.TestCase):
@@ -33,15 +57,17 @@ class RunTest(unittest.TestCase):
         self.assertEqual(clock.slept, [5])
         self.assertEqual(self.store.status()["cycles"], 1)
 
-    def test_retention_runs_hourly_from_the_loop(self):
-        # A phone seen 30 days ago must be forgotten by the first purge, and the
-        # next purge only happens an hour later.
+    def test_retention_and_summary_run_hourly_from_the_loop(self):
+        # A phone seen 30 days ago is forgotten by the first purge; the next
+        # purge and the hourly summary come once the clock has passed an hour.
         self.store.record_cycle(at(1, 8), adverts((PHONE, -60)))
-        source = ScriptedSource([adverts((WATCH, -60))] * 3)
-        clock = Clock(at(31, 8), step=60)
+        source = ScriptedSource([adverts((WATCH, -60))] * 4)
+        clock = Clock(at(31, 8), step=1300)
         with self.assertLogs("btlog", level="INFO") as logs:
             run(source, self.store, self.conf, clock=clock, sleep=clock.sleep)
         self.assertEqual(sum("forgot 1 random" in line for line in logs.output), 1)
+        self.assertEqual([line for line in logs.output if "last hour" in line],
+                         ["INFO:btlog:last hour: 3 cycles, 1 distinct addresses"])
         self.assertEqual([d["address"] for d in self.store.devices(private=True)], [WATCH])
 
 

@@ -2,7 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from btlog.store import FORGOTTEN, Store, address_kind, local_hour
+from btlog.store import FORGOTTEN, Store, address_kind, after, local_hour, printable
 from helpers import BEACON, NRPA, PHONE, WATCH, adverts, at, weekday
 
 
@@ -18,6 +18,17 @@ class AddressKindTest(unittest.TestCase):
 
     def test_local_hour(self):
         self.assertEqual(local_hour(at(19, 8, 30)), ("2026-10-19", 8, weekday(19)))
+
+    def test_after_cuts_rollups_at_the_hour(self):
+        self.assertEqual(after(None), ("1", ()))
+        self.assertEqual(after(at(19, 8, 30), "c"),
+                         ("(c.day > ? OR (c.day = ? AND c.hour >= ?))", ("2026-10-19", "2026-10-19", 8)))
+
+    def test_printable(self):
+        self.assertEqual(printable("evil\x1b[2J\nname\t"), "evil[2Jname")  # no ESC, no sequence
+        self.assertEqual(printable("Zoë's Watch"), "Zoë's Watch")
+        self.assertIsNone(printable("\x07"))
+        self.assertIsNone(printable(None))
 
 
 class RecordTest(unittest.TestCase):
@@ -88,6 +99,28 @@ class RecordTest(unittest.TestCase):
         s = self.store.status()
         self.assertEqual((s["devices"], s["private"], s["sightings"], s["cycles"], s["last_cycle"], s["first_day"]),
                          (1, 0, 1, 1, at(19, 8), "2026-10-19"))
+        # A quiet cycle still counts as the last cycle: a dead daemon and a
+        # quiet room must not look the same.
+        self.store.record_cycle(at(19, 23, 50), [])
+        self.assertEqual(self.store.status()["last_cycle"], at(19, 23, 50))
+
+    def test_kind_upgrades_from_unknown_only(self):
+        from btlog.scanner import Advert
+        self.store.record_cycle(at(19, 8), [Advert(WATCH, -60)])
+        self.assertEqual(self.store.find(WATCH)["kind"], "unknown")
+        self.store.record_cycle(at(19, 9), adverts((WATCH, -60)))
+        self.assertEqual(self.store.find(WATCH)["kind"], "static")
+        self.store.record_cycle(at(19, 10), [Advert(WATCH, -60)])
+        self.assertEqual(self.store.find(WATCH)["kind"], "static")
+
+    def test_forget_one_device(self):
+        self.store.record_cycle(at(19, 8), adverts((WATCH, -60), (BEACON, -70)))
+        self.store.forget(WATCH)
+        self.assertEqual([d["address"] for d in self.store.devices()], [BEACON])
+        self.assertEqual(self.store.status()["cycles"], 1)
+        self.assertEqual(self.store.conn.execute("SELECT COUNT(*) AS n FROM hourly").fetchone()["n"], 1)
+        with self.assertRaises(LookupError):
+            self.store.forget(WATCH)
 
 
 class PurgeTest(unittest.TestCase):
@@ -115,9 +148,17 @@ class PurgeTest(unittest.TestCase):
             "SELECT hour, cycles, rssi_max, rssi_sum FROM hourly WHERE device_id = ? ORDER BY hour", (f["id"],)).fetchall()
         self.assertEqual([tuple(r.values()) for r in folded], [(8, 2, -60, -130), (9, 1, -50, -50)])
         self.assertEqual(self.store.conn.execute("SELECT COUNT(*) AS n FROM sightings").fetchone()["n"], 3)
-        # A second purge with nothing to forget leaves the pseudo-device alone.
+        # A second purge with nothing to forget leaves the pseudo-device alone,
+        # and one with a new stale address folds into it.
         self.assertEqual(self.store.purge(at(21, 12), 365, 7), (0, 0))
         self.assertEqual(self.store.forgotten()["cycles"], 3)
+        self.store.record_cycle(at(21, 8), adverts(("4A:00:00:00:00:02", -40)))
+        self.assertEqual(self.store.purge(at(30, 12), 365, 7), (0, 1))
+        f = self.store.forgotten()
+        self.assertEqual((f["cycles"], f["first_seen"]), (4, at(1, 8)))
+        folded = self.store.conn.execute(
+            "SELECT day, cycles, rssi_max FROM hourly WHERE device_id = ? AND hour = 8 ORDER BY day", (f["id"],)).fetchall()
+        self.assertEqual([tuple(r.values()) for r in folded], [("2026-10-01", 2, -60), ("2026-10-21", 1, -40)])
 
     def test_recently_seen_private_address_survives(self):
         self.store.record_cycle(at(20, 9), adverts((PHONE, -60)))
