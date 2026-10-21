@@ -92,6 +92,7 @@ CREATE TABLE IF NOT EXISTS readings (
     value REAL NOT NULL,            -- the last one heard in the cycle
     PRIMARY KEY (device_id, kind, ts)
 ) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS readings_ts ON readings(ts);  -- purge deletes by age, like sightings
 CREATE TABLE IF NOT EXISTS hourly_readings (
     device_id INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
     day TEXT NOT NULL,
@@ -111,6 +112,7 @@ CREATE TABLE IF NOT EXISTS payloads (
     data BLOB NOT NULL,             -- the last bytes heard in the cycle
     PRIMARY KEY (device_id, ts, field)
 ) WITHOUT ROWID;
+CREATE INDEX IF NOT EXISTS payloads_ts ON payloads(ts);
 CREATE TABLE IF NOT EXISTS alerts (
     id INTEGER PRIMARY KEY,
     rule TEXT NOT NULL,             -- silent, away, range, unusual or scanner

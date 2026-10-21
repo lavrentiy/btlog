@@ -161,6 +161,14 @@ class PurgeTest(unittest.TestCase):
         self.assertEqual([s["address"] for s in self.store.sightings()], [WATCH])
         self.assertEqual(self.store.conn.execute("SELECT COUNT(*) AS n FROM hourly").fetchone()["n"], 6)
 
+    def test_purge_finds_old_rows_by_index(self):
+        # The hourly purge runs for years: it must seek to the old rows, not
+        # read every raw row the database holds.
+        for table in ("sightings", "readings", "payloads"):
+            plan = [r["detail"] for r in self.store.conn.execute(
+                f"EXPLAIN QUERY PLAN DELETE FROM {table} WHERE ts < ?", (0,))]
+            self.assertTrue(any(f"INDEX {table}_ts" in p for p in plan), (table, plan))
+
     def test_forgetting_private_addresses_keeps_the_counts(self):
         sightings, devices = self.store.purge(at(20, 12), retention_days=365, forget_random_days=7)
         self.assertEqual((sightings, devices), (0, 2))
