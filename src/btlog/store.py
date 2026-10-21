@@ -92,22 +92,31 @@ def local_hour(ts):
     return dt.strftime("%Y-%m-%d"), dt.hour, dt.weekday()
 
 
-def after(since, table=""):
-    """SQL condition and parameters for rollup rows at or after since, to the
-    hour. The rollups are keyed on (day, hour), so '--since 2h' must not pull
-    in the whole of today. None (for 'all') matches everything."""
-    if since is None:
-        return "1", ()
-    day, hour, _ = local_hour(since)
+def between(since, until, table=""):
+    """SQL condition and parameters for rollup rows from since up to (not
+    including) until, to the hour. The rollups are keyed on (day, hour), so
+    '--since 2h' must not pull in the whole of today. None means open-ended."""
     t = f"{table}." if table else ""
-    return f"({t}day > ? OR ({t}day = ? AND {t}hour >= ?))", (day, day, hour)
+    conds, args = [], []
+    if since is not None:
+        day, hour, _ = local_hour(since)
+        conds.append(f"({t}day > ? OR ({t}day = ? AND {t}hour >= ?))")
+        args += [day, day, hour]
+    if until is not None:
+        day, hour, _ = local_hour(until)
+        conds.append(f"({t}day < ? OR ({t}day = ? AND {t}hour < ?))")
+        args += [day, day, hour]
+    return " AND ".join(conds) or "1", tuple(args)
 
 
 def printable(text):
-    """A device name with control characters removed. Names come from strangers'
-    advertisements and go to terminals, so an escape sequence that clears the
-    screen or retitles the window must not get through."""
-    return "".join(c for c in text if c.isprintable()) or None if text else None
+    """A device name with control characters removed, or None if nothing is
+    left. Names come from strangers' advertisements and go to terminals, so an
+    escape sequence that clears the screen or retitles the window must not
+    get through."""
+    if not text:
+        return None
+    return "".join(c for c in text if c.isprintable()) or None
 
 
 def _row(cursor, row):
@@ -229,12 +238,15 @@ class Store:
                             rssi_max = max(rssi_max, excluded.rssi_max),
                             rssi_sum = rssi_sum + excluded.rssi_sum""",
                     (sink, *stale[1]))
-                self.conn.execute(
-                    f"""UPDATE devices SET cycles = cycles + (SELECT COALESCE(SUM(cycles), 0) FROM devices WHERE {stale[0]}),
-                        first_seen = min(first_seen, (SELECT min(first_seen) FROM devices WHERE {stale[0]}))
-                        WHERE id = ?""", (*stale[1], *stale[1], sink))
             devices = self.conn.execute(f"DELETE FROM devices WHERE {stale[0]}", stale[1]).rowcount
         return sightings, devices
+
+    def backup(self, dest):
+        """A consistent copy of the database through SQLite's backup API: a
+        plain file copy of a WAL database can miss the last writes or tear."""
+        with sqlite3.connect(str(dest)) as copy:
+            self.conn.backup(copy)
+        copy.close()
 
     # ---------- Reading ----------
 
@@ -253,10 +265,6 @@ class Store:
             f"""SELECT d.*, (SELECT COUNT(*) FROM hourly WHERE device_id = d.id) AS hours
                 FROM devices d WHERE {' AND '.join(where)} ORDER BY last_seen DESC, address""", args).fetchall()
 
-    def forgotten(self):
-        """The forgotten-random-addresses pseudo-device, or None."""
-        return self.conn.execute("SELECT * FROM devices WHERE address = ?", (FORGOTTEN,)).fetchone()
-
     def find(self, text):
         """The one device whose address, label or name is text or starts with it,
         case insensitively. An exact address or label wins over prefix matches;
@@ -274,12 +282,15 @@ class Store:
             raise LookupError(f"{text!r} matches {len(rows)} devices; use the full address")
         return {k: v for k, v in rows[0].items() if k != "exact"}
 
-    def sightings(self, since=None, device_id=None):
+    def sightings(self, since=None, until=None, device_id=None):
         """Raw sightings, oldest first, with the device's address, kind, name and label."""
         where, args = ["1"], []
         if since is not None:
             where.append("s.ts >= ?")
             args.append(since)
+        if until is not None:
+            where.append("s.ts < ?")
+            args.append(until)
         if device_id is not None:
             where.append("s.device_id = ?")
             args.append(device_id)
@@ -290,12 +301,10 @@ class Store:
 
     def status(self):
         """Counts and the last cycle, for `btlog status` and the dashboard header."""
-        one = lambda sql: self.conn.execute(sql).fetchone()  # noqa: E731
-        return {
-            "devices": one("SELECT COUNT(*) AS n FROM devices WHERE kind NOT IN ('rpa', 'nrpa', 'forgotten')")["n"],
-            "private": one("SELECT COUNT(*) AS n FROM devices WHERE kind IN ('rpa', 'nrpa')")["n"],
-            "sightings": one("SELECT COUNT(*) AS n FROM sightings")["n"],
-            "cycles": one("SELECT COALESCE(SUM(count), 0) AS n FROM cycles")["n"],
-            "last_cycle": one("SELECT MAX(last_ts) AS t FROM cycles")["t"],
-            "first_day": one("SELECT MIN(day) AS d FROM cycles")["d"],
-        }
+        return self.conn.execute(
+            """SELECT (SELECT COUNT(*) FROM devices WHERE kind NOT IN ('rpa', 'nrpa', 'forgotten')) AS devices,
+                      (SELECT COUNT(*) FROM devices WHERE kind IN ('rpa', 'nrpa')) AS private,
+                      (SELECT COUNT(*) FROM sightings) AS sightings,
+                      (SELECT COALESCE(SUM(count), 0) FROM cycles) AS cycles,
+                      (SELECT MAX(last_ts) FROM cycles) AS last_cycle,
+                      (SELECT MIN(day) FROM cycles) AS first_day""").fetchone()

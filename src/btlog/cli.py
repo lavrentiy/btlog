@@ -12,13 +12,14 @@ Bluetooth LE devices in proximity, and answers questions about the trends.
   btlog name DEVICE LABEL          label a device ("" removes the label)
   btlog forget DEVICE              remove one device and everything recorded about it
   btlog export [--since 1d]        raw sightings as CSV (or JSON with --json)
+  btlog backup FILE                consistent copy of the database
   btlog purge                      apply retention now (the daemon does it hourly)
   btlog status [--check]           database size and the last scan cycle (--check: exit 1 if stale)
   btlog web                        read-only dashboard on http://127.0.0.1:8778 (no authentication)
   btlog daemon                     the scanner itself (runs as a service)
 
 DEVICE is an address, a label, a name or an unambiguous prefix of one.
---since takes 30m, 2h, 3d, today, yesterday, 2026-10-18, 2026-10-18T19:30 or all.
+--since and --until take 30m, 2h, 3d, today, yesterday, 2026-10-18, 2026-10-18T19:30 or all.
 """
 
 import argparse
@@ -49,6 +50,13 @@ def bar(value, scale, width=20):
     return full + part + " " * (width - len(full) - len(part))
 
 
+def cell(value, scale):
+    """One character of a heatmap: a dot where the scanner did not run."""
+    if value is None:
+        return "·"
+    return BAR[round(min(value, scale) / scale * 8)] if scale else " "
+
+
 def table(rows, head):
     """Columns padded to the widest cell, header first."""
     rows = [head] + [[str(c) for c in r] for r in rows]
@@ -75,18 +83,25 @@ def public(d):
     return {k: v for k, v in d.items() if k != "id"} | {"vendor": vendors.name(d["manufacturer"])}
 
 
-def presence_lines(values, labels, scale, fmt):
-    """One line per slot. Fractions of a device's presence are always drawn
-    against 100%, so a device that is around 20% of the time gets a short bar
-    rather than a full one; device counts are drawn against their maximum."""
+def presence(values, labels, device):
+    """One line per slot. A device's presence is a share and is drawn against
+    100%, so a device around 20% of the time gets a short bar; device counts
+    are drawn against their maximum."""
+    if device:
+        scale, fmt = 1.0, "{:.0%}"
+    else:
+        scale, fmt = max((v for v in values if v is not None), default=0), "{:.1f}"
     return "\n".join(f"{lab:>3}  {bar(v, scale)}  {'' if v is None else fmt.format(v)}".rstrip()
                      for lab, v in zip(labels, values))
 
 
-def presence(values, labels, device):
-    if device:
-        return presence_lines(values, labels, 1.0, "{:.0%}")
-    return presence_lines(values, labels, max((v for v in values if v is not None), default=0), "{:.1f}")
+def period(a):
+    """(since, until) from the flags, as unix seconds or None."""
+    return when.parse(a.since), when.parse(a.until) if a.until else None
+
+
+def period_text(a):
+    return f"since {a.since}" + (f" until {a.until}" if a.until else "")
 
 
 # ---------- Commands ----------
@@ -103,22 +118,21 @@ def cmd_devices(store, a):
 
 def cmd_show(store, a):
     d = store.find(a.device)
-    since = when.parse(a.since)
-    hours, days = trends.hours(store, d["id"], since), trends.weekdays(store, d["id"], since)
+    since, until = period(a)
+    hours, days = trends.hours(store, d["id"], since, until), trends.weekdays(store, d["id"], since, until)
     emit(a, {**public(d), "hours": hours, "weekdays": days}, "\n".join([
         f"{d['address']}  {d['kind']}  {who(d)}".rstrip(),
         f"first seen {when.fmt(d['first_seen'])}, last seen {when.fmt(d['last_seen'])}, "
         f"{d['cycles']} sightings, vendor {vendors.name(d['manufacturer']) or '-'}",
-        "", f"presence by hour of day since {a.since} (share of scan cycles):", presence(hours, HOURS, d),
+        "", f"presence by hour of day {period_text(a)} (share of scan cycles):", presence(hours, HOURS, d),
         "", "by weekday:", presence(days, trends.WEEKDAYS, d)]))
 
 
 def _presence(store, a, fn, labels, title):
-    since = when.parse(a.since)
     d = store.find(a.device) if a.device else None
-    values = fn(store, d["id"] if d else None, since)
-    text = (f"{title} for {d['address']} {who(d)}".rstrip() + f" since {a.since} (share of scan cycles)" if d
-            else f"{title} since {a.since} (average devices heard per scan cycle)")
+    values = fn(store, d["id"] if d else None, *period(a))
+    text = (f"{title} for {d['address']} {who(d)}".rstrip() + f" {period_text(a)} (share of scan cycles)" if d
+            else f"{title} {period_text(a)} (average devices heard per scan cycle)")
     emit(a, values, text + "\n" + presence(values, labels, d))
 
 
@@ -132,43 +146,43 @@ def cmd_days(store, a):
 
 def cmd_heat(store, a):
     """One row per day, one cell per hour: a presence calendar."""
-    since = when.parse(a.since)
     d = store.find(a.device) if a.device else None
-    rows = trends.timeline(store, d["id"] if d else None, since)
+    rows = trends.timeline(store, d["id"] if d else None, *period(a))
     days = {}
     for r in rows:
         days.setdefault(r["day"], [None] * 24)[r["hour"]] = r["presence"]
-    scale = 1.0 if d else max((r["presence"] for r in rows), default=0)
-    head = "            " + "".join(f"{h:<3d}" for h in range(0, 24, 3))
-    text = (f"presence of {d['address']} {who(d)}".rstrip() if d else "devices heard per scan cycle") \
-        + f" since {a.since}, one row per day, one cell per hour" + ("" if d else f" (full cell = {scale:.1f})") + "\n"
-    text += head + "\n" + "\n".join(
-        day + "  " + "".join("·" if v is None else BAR[round(min(v, scale) / scale * 8)] if scale else " " for v in cells)
-        for day, cells in days.items())
-    emit(a, [dict(r) for r in rows], text)
+    if d:
+        title, scale = f"presence of {d['address']} {who(d)}".rstrip(), 1.0
+    else:
+        scale = max((r["presence"] for r in rows), default=0)
+        title = f"devices heard per scan cycle (full cell = {scale:.1f})"
+    lines = [f"{title} {period_text(a)}, one row per day, one cell per hour",
+             "            " + "".join(f"{h:<3d}" for h in range(0, 24, 3))]
+    lines += [f"{day}  " + "".join(cell(v, scale) for v in cells) for day, cells in days.items()]
+    emit(a, [dict(r) for r in rows], "\n".join(lines))
 
 
 def cmd_rssi(store, a):
     d = store.find(a.device)
-    rows = trends.rssi(store, d["id"], when.parse(a.since), a.by)
+    rows = trends.rssi(store, d["id"], *period(a), by=a.by)
     # RSSI is negative dBm; bars grow from -100 towards 0 so nearer reads as longer.
-    text = f"signal of {d['address']} {who(d)} by {a.by} since {a.since} (dBm, max / average)\n"
+    text = f"signal of {d['address']} {who(d)} by {a.by} {period_text(a)} (dBm, max / average)\n"
     text += "\n".join(f"{r['when']}  {bar(max(r['avg'] + 100, 0), 100)}  {r['max']:4d} / {r['avg']:6.1f}" for r in rows)
     emit(a, rows, text)
 
 
 def cmd_new(store, a):
-    since = when.parse(a.since)
+    since, until = period(a)
     if since is None:
         raise ValueError("new needs a --since other than all")
-    rows = trends.new(store, since)
+    rows = trends.new(store, since, until)
     emit(a, [public(d) for d in rows],
          table([[d["address"], d["kind"], who(d), when.fmt(d["first_seen"]), d["cycles"]] for d in rows],
                ["ADDRESS", "KIND", "LABEL/NAME", "FIRST SEEN", "SIGHTINGS"]))
 
 
 def cmd_top(store, a):
-    rows = trends.busiest(store, when.parse(a.since), a.limit)
+    rows = trends.busiest(store, *period(a), limit=a.limit)
     emit(a, [public(d) for d in rows],
          table([[d["address"], d["kind"], who(d), d["hours"], d["cycles_heard"]] for d in rows],
                ["ADDRESS", "KIND", "LABEL/NAME", "HOURS", "SIGHTINGS"]))
@@ -189,9 +203,8 @@ def cmd_forget(store, a):
 def cmd_export(store, a):
     """Sightings as CSV: unix seconds and local time, so the hour that repeats
     when daylight saving ends is still unambiguous."""
-    since = when.parse(a.since)
     did = store.find(a.device)["id"] if a.device else None
-    rows = store.sightings(since, did)
+    rows = store.sightings(*period(a), device_id=did)
     if a.json:
         return print(json.dumps([dict(s) for s in rows], indent=2))
     out = csv.writer(sys.stdout, lineterminator="\n")
@@ -201,11 +214,15 @@ def cmd_export(store, a):
                       s["label"] or "", s["rssi"], s["adverts"]])
 
 
+def cmd_backup(store, a):
+    store.backup(a.file)
+    print(f"database copied to {a.file}")
+
+
 def cmd_purge(store, a, conf):
     sightings, devices = store.purge(time.time(), conf.retention_days, conf.forget_random_days)
-    kept = lambda days: f"{days} days" if days else "ever (kept forever)"  # noqa: E731
-    print(f"deleted {sightings} sightings older than {kept(conf.retention_days)}, "
-          f"forgot {devices} private addresses unseen for {kept(conf.forget_random_days)}")
+    print(f"deleted {sightings} sightings older than {conf.retention_days or 'ever'} days, "
+          f"forgot {devices} private addresses unseen for {conf.forget_random_days or 'ever'} days")
 
 
 def cmd_status(store, a, conf):
@@ -214,7 +231,7 @@ def cmd_status(store, a, conf):
     emit(a, {**s, "stale": stale}, "\n".join([
         f"database   {conf.db}",
         f"devices    {s['devices']} (plus {s['private']} rotating private addresses)",
-        f"sightings  {s['sightings']} (kept {conf.retention_days} days)",
+        f"sightings  {s['sightings']} (kept {conf.retention_days or 'ever'} days)",
         f"cycles     {s['cycles']} since {s['first_day'] or '-'}",
         f"last cycle {when.fmt(s['last_cycle'], seconds=True)}" + (" (stale: is the daemon running?)" if stale else "")]))
     return 1 if a.check and stale else 0
@@ -259,6 +276,7 @@ def parser():
         s = sub.add_parser(name, help=name, parents=[common(argparse.SUPPRESS)])
         if since:
             s.add_argument("--since", default=since, help=f"30m, 2h, 3d, today, 2026-10-18 or all (default {since})")
+            s.add_argument("--until", help="same forms; the end of the period (default: now)")
         if device == "optional":
             s.add_argument("device", nargs="?")
         elif device:
@@ -276,6 +294,7 @@ def parser():
     add("name", device=True).add_argument("label")
     add("forget", device=True)
     add("export", since="1d").add_argument("-d", "--device")
+    add("backup").add_argument("file")
     add("purge")
     add("status").add_argument("--check", action="store_true", help="exit 1 when the last cycle is older than 3 intervals")
     add("web").add_argument("--bind", help="HOST:PORT (default from config, 127.0.0.1:8778)")

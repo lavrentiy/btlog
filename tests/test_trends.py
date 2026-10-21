@@ -48,6 +48,9 @@ class PresenceTest(unittest.TestCase):
         h = trends.hours(self.store, self.watch, since=at(19, 12, 30))
         self.assertEqual((h[7], h[11], h[12], h[18]), (None, None, 0.0, 1.0))
         self.assertEqual(len(trends.timeline(self.store, self.watch, since=at(19, 12, 30))), 12)
+        self.assertEqual(len(trends.timeline(self.store, self.watch, since=at(19, 12, 30), until=at(19, 15))), 3)
+        self.assertEqual(trends.hours(self.store, self.watch, until=at(19, 8))[6:9], [1.0, 1.0, None])
+        self.assertEqual([(d["address"], d["cycles_heard"]) for d in trends.busiest(self.store, until=at(19, 6))], [(BEACON, 36)])
         self.assertEqual(trends.rssi(self.store, self.watch, since=at(19, 18)), [{"when": "2026-10-19", "max": -60, "avg": -60.0}])
         top = trends.busiest(self.store, since=at(19, 9))
         self.assertEqual([(d["address"], d["cycles_heard"]) for d in top], [(BEACON, 90), (WATCH, 36)])
@@ -107,6 +110,7 @@ class RssiAndNewTest(unittest.TestCase):
     def test_new_devices_skip_rotating_addresses(self):
         self.assertEqual([d["address"] for d in trends.new(self.store, at(20, 0))], [BEACON])
         self.assertEqual([d["address"] for d in trends.new(self.store, at(19, 0))], [BEACON, WATCH])
+        self.assertEqual([d["address"] for d in trends.new(self.store, at(19, 0), until=at(20, 0))], [WATCH])
 
     def test_busiest(self):
         top = trends.busiest(self.store, limit=5)

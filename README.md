@@ -41,12 +41,15 @@ btlog top --since 7d                   # devices around the most
 btlog forget "neighbour's tv"          # remove one device and everything recorded about it
 btlog export --since 2d > sightings.csv
 btlog export --since 2h --json
+btlog export --since 2026-10-01 --until 2026-11-01 > october.csv
+btlog backup /mnt/nas/btlog-$(date +%F).db   # consistent copy, safe while the daemon writes
 btlog status --check                   # exit 1 when the daemon has not scanned for 3 intervals
 ```
 
 A device is an address, a label, an advertised name or an unambiguous prefix of
-one. `--since` takes `30m`, `2h`, `3d`, `today`, `yesterday`, `2026-10-18`,
-`2026-10-18T19:30` or `all`; the trend commands cut at the hour it falls in.
+one. `--since` and `--until` take `30m`, `2h`, `3d`, `today`, `yesterday`,
+`2026-10-18`, `2026-10-18T19:30` or `all`; the trend commands cut at the hour
+they fall in.
 `--json`, `--db` and `--config` go before or after the subcommand.
 
 ```
@@ -88,7 +91,7 @@ One dark page, no frameworks: the devices on the left; for the selected device
 (or all of them) presence by hour of day and by weekday, a day-by-hour heatmap,
 signal strength per day, and the new devices of the last week. The same data is
 served as JSON under `/api/` (`status`, `devices`, `hours`, `days`, `timeline`,
-`rssi`, `new`, each taking `since` and `device` where it makes sense).
+`rssi`, `new`, each taking `since`, `until` and `device` where it makes sense).
 
 The dashboard opens the database read-only and never writes. Device names come
 from strangers' advertisements, so the page escapes everything before it goes
@@ -139,8 +142,9 @@ forget_random_days = 0    # never remove rotating private addresses
 ```
 
 That is the whole change for a shop that wants a log to hand over after a
-break-in, with `btlog export --since 2026-10-17 --json` as the output and
-`sha256sum` on the file as the seal. Know what you are getting: a rotating
+break-in, with `btlog export --since 2026-10-17 --until 2026-10-18 --json` as
+the output, `sha256sum` on the file as the seal, and `btlog backup` for the
+nightly copy (a plain file copy of a database in WAL mode can tear). Know what you are getting: a rotating
 address still cannot be tied to a person without that person's device, a
 signal strength does not say inside or outside, and logging the devices of
 everyone who walks past is processing their personal data, which in the EU

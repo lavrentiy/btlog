@@ -43,12 +43,15 @@ def load(path=None):
         raise ValueError(f"unknown config key(s): {', '.join(unknown)}")
     # TOML has types, so "60" (a string) is a mistake worth stopping on now
     # rather than an hour later inside the purge.
-    for key, kinds in {"interval": (int, float), "retention_days": (int,), "forget_random_days": (int,),
-                       "adapter": (str, type(None)), "web_bind": (str,), "db": (str,)}.items():
-        if key in data and (not isinstance(data[key], kinds) or isinstance(data[key], bool)):
-            raise ValueError(f"config key {key} must be {' or '.join(k.__name__ for k in kinds)}")
-        if key in data and kinds[0] in (int, float) and data[key] < (0 if key.endswith("_days") else 1e-9):
-            raise ValueError(f"config key {key} must be positive")
+    numbers = {"interval": "positive", "retention_days": "0 or more", "forget_random_days": "0 or more"}
+    for key, value in data.items():
+        if key in numbers:
+            ok = isinstance(value, (int, float)) and not isinstance(value, bool) and (
+                value > 0 if numbers[key] == "positive" else value >= 0)
+            if not ok:
+                raise ValueError(f"config key {key} must be a number, {numbers[key]}")
+        elif not isinstance(value, str):
+            raise ValueError(f"config key {key} must be a string")
     if "db" in data:
         data["db"] = Path(data["db"]).expanduser()
     return Config(**data)

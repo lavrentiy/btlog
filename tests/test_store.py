@@ -2,7 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from btlog.store import FORGOTTEN, Store, address_kind, after, local_hour, printable
+from btlog.store import FORGOTTEN, Store, address_kind, between, local_hour, printable
 from helpers import BEACON, NRPA, PHONE, WATCH, adverts, at, weekday
 
 
@@ -19,10 +19,14 @@ class AddressKindTest(unittest.TestCase):
     def test_local_hour(self):
         self.assertEqual(local_hour(at(19, 8, 30)), ("2026-10-19", 8, weekday(19)))
 
-    def test_after_cuts_rollups_at_the_hour(self):
-        self.assertEqual(after(None), ("1", ()))
-        self.assertEqual(after(at(19, 8, 30), "c"),
+    def test_between_cuts_rollups_at_the_hour(self):
+        self.assertEqual(between(None, None), ("1", ()))
+        self.assertEqual(between(at(19, 8, 30), None, "c"),
                          ("(c.day > ? OR (c.day = ? AND c.hour >= ?))", ("2026-10-19", "2026-10-19", 8)))
+        self.assertEqual(between(None, at(19, 8, 30)),
+                         ("(day < ? OR (day = ? AND hour < ?))", ("2026-10-19", "2026-10-19", 8)))
+        cond, args = between(at(19, 8), at(20, 8))
+        self.assertEqual((cond.count(" AND "), len(args)), (3, 6))
 
     def test_printable(self):
         self.assertEqual(printable("evil\x1b[2J\nname\t"), "evil[2Jname")  # no ESC, no sequence
@@ -142,22 +146,20 @@ class PurgeTest(unittest.TestCase):
         sightings, devices = self.store.purge(at(20, 12), retention_days=365, forget_random_days=7)
         self.assertEqual((sightings, devices), (0, 2))
         self.assertEqual([d["address"] for d in self.store.devices(private=True)], [WATCH])
-        f = self.store.forgotten()
-        self.assertEqual((f["kind"], f["cycles"], f["first_seen"]), (FORGOTTEN, 3, at(1, 8)))
+        sink = self.store.conn.execute("SELECT * FROM devices WHERE kind = ?", (FORGOTTEN,)).fetchone()
+        self.assertNotIn(sink["address"], [d["address"] for d in self.store.devices(private=True)])
         folded = self.store.conn.execute(
-            "SELECT hour, cycles, rssi_max, rssi_sum FROM hourly WHERE device_id = ? ORDER BY hour", (f["id"],)).fetchall()
+            "SELECT hour, cycles, rssi_max, rssi_sum FROM hourly WHERE device_id = ? ORDER BY hour", (sink["id"],)).fetchall()
         self.assertEqual([tuple(r.values()) for r in folded], [(8, 2, -60, -130), (9, 1, -50, -50)])
-        self.assertEqual(self.store.conn.execute("SELECT COUNT(*) AS n FROM sightings").fetchone()["n"], 3)
-        # A second purge with nothing to forget leaves the pseudo-device alone,
-        # and one with a new stale address folds into it.
+        self.assertEqual(self.store.status()["sightings"], 3)
+        # A second purge with nothing to forget changes nothing; one with a new
+        # stale address folds into the same pseudo-device.
         self.assertEqual(self.store.purge(at(21, 12), 365, 7), (0, 0))
-        self.assertEqual(self.store.forgotten()["cycles"], 3)
         self.store.record_cycle(at(21, 8), adverts(("4A:00:00:00:00:02", -40)))
         self.assertEqual(self.store.purge(at(30, 12), 365, 7), (0, 1))
-        f = self.store.forgotten()
-        self.assertEqual((f["cycles"], f["first_seen"]), (4, at(1, 8)))
+        self.assertEqual(self.store.conn.execute("SELECT COUNT(*) AS n FROM devices WHERE kind = ?", (FORGOTTEN,)).fetchone()["n"], 1)
         folded = self.store.conn.execute(
-            "SELECT day, cycles, rssi_max FROM hourly WHERE device_id = ? AND hour = 8 ORDER BY day", (f["id"],)).fetchall()
+            "SELECT day, cycles, rssi_max FROM hourly WHERE device_id = ? AND hour = 8 ORDER BY day", (sink["id"],)).fetchall()
         self.assertEqual([tuple(r.values()) for r in folded], [("2026-10-01", 2, -60), ("2026-10-21", 1, -40)])
 
     def test_zero_means_keep_forever(self):
@@ -185,6 +187,18 @@ class FileTest(unittest.TestCase):
                     self.assertEqual(len(r.devices()), 1)
                     with self.assertRaises(Exception):
                         r.set_label(WATCH, "x")
+
+    def test_backup_is_a_complete_copy(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path, copy = Path(tmp) / "btlog.db", Path(tmp) / "copy.db"
+            with Store(path) as w:
+                w.record_cycle(at(19, 8), adverts((WATCH, -60)))
+                with Store(path, readonly=True) as r:  # the CLI backs up from a read-only handle
+                    r.backup(copy)
+                w.record_cycle(at(19, 9), adverts((WATCH, -60)))
+            with Store(copy, readonly=True) as c:
+                self.assertEqual(c.status()["cycles"], 1)
+                self.assertEqual(c.find(WATCH)["address"], WATCH)
 
 
 if __name__ == "__main__":

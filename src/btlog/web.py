@@ -157,25 +157,26 @@ class Handler(BaseHTTPRequestHandler):
 
     def api(self, store, path, q):
         since = when.parse(q.get("since", "30d"))
+        until = when.parse(q["until"]) if q.get("until") else None
         did = store.find(q["device"])["id"] if q.get("device") else None
         if path == "/api/status":
             return store.status()
         if path == "/api/devices":
             return [_public(d) for d in store.devices(private=q.get("private") == "1")]
         if path == "/api/hours":
-            return trends.hours(store, did, since)
+            return trends.hours(store, did, since, until)
         if path == "/api/days":
-            return trends.weekdays(store, did, since)
+            return trends.weekdays(store, did, since, until)
         if path == "/api/timeline":
-            return trends.timeline(store, did, since)
+            return trends.timeline(store, did, since, until)
         if path == "/api/rssi":
             if did is None:
                 raise ValueError("device required")
-            return trends.rssi(store, did, since, q.get("by", "day"))
+            return trends.rssi(store, did, since, until, by=q.get("by", "day"))
         if path == "/api/new":
             if since is None:
                 raise ValueError("since required")
-            return [_public(d) for d in trends.new(store, since)]
+            return [_public(d) for d in trends.new(store, since, until)]
         return None
 
     def reply(self, body, ctype, status=HTTPStatus.OK):

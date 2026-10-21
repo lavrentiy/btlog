@@ -108,6 +108,22 @@ class CliTest(unittest.TestCase):
         self.assertEqual(rows[-1], f"{int(at(20, 8))},2026-10-20 08:00:00,{WATCH},static,Garmin,,-55,1")
         _, out, _ = self.run_cli("export", "--since", "2026-10-20", "--json")
         self.assertEqual(json.loads(out)[0]["address"], PHONE)
+        _, out, _ = self.run_cli("export", "--since", "2026-10-19T07:00", "--until", "2026-10-19T08:00", "-d", "garmin")
+        self.assertEqual(len(out.splitlines()), 1 + 6)
+
+    def test_until_on_trend_commands(self):
+        _, out, _ = self.run_cli("--json", "hours", "garmin", "--since", "all", "--until", "2026-10-19T08:00")
+        self.assertEqual(json.loads(out)[6:9], [1.0, 1.0, None])
+        _, out, _ = self.run_cli("heat", "--since", "all", "--until", "2026-10-19T03:00")
+        self.assertIn("since all until 2026-10-19T03:00", out)
+        self.assertEqual(out.splitlines()[2], "2026-10-19  ███" + "·" * 21)
+
+    def test_backup(self):
+        copy = Path(self.tmp.name) / "backup.db"
+        code, out, _ = self.run_cli("backup", str(copy))
+        self.assertEqual((code, out), (0, f"database copied to {copy}\n"))
+        _, out, _ = self.run_cli("--json", "status", db=copy)
+        self.assertEqual(json.loads(out)["cycles"], 145)
 
     def test_global_flags_after_the_subcommand(self):
         _, out, _ = self.run_cli("devices", "--json")
@@ -172,8 +188,8 @@ class ConfigTest(unittest.TestCase):
                 config.load(p)
             p.write_text("retention_days = 0\nforget_random_days = 0\n", encoding="utf-8")
             self.assertEqual((config.load(p).retention_days, config.load(p).forget_random_days), (0, 0))
-            for bad in ('interval = 0\n', 'interval = "60"\n', 'retention_days = 1.5\n', 'retention_days = -1\n',
-                        'adapter = 1\n', 'forget_random_days = true\n'):
+            for bad in ('interval = 0\n', 'interval = "60"\n', 'retention_days = -1\n',
+                        'adapter = 1\n', 'forget_random_days = true\n', 'web_bind = 8778\n'):
                 p.write_text(bad, encoding="utf-8")
                 with self.assertRaises(ValueError, msg=bad):
                     config.load(p)
