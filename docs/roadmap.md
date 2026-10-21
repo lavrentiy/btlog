@@ -168,7 +168,7 @@ As built, where it differs or adds to the above:
 
 Roughly 200 lines with tests.
 
-## Phase 3: rules and notifications
+## Phase 3 (done): rules and notifications
 
 - **`rules.py`**: each rule is a function over the store that returns the
   alerts that hold now.
@@ -208,6 +208,44 @@ Roughly 200 lines with tests.
 - **API**: `/api/present` (labelled devices heard in the last N minutes)
   and `/api/alerts`, for Home Assistant or a shell script.
 
+As built, where it differs or adds to the above:
+
+- Only labelled devices are watched, by every rule; see Decisions. So
+  `silent` is a labelled device with readings, and a labelled device
+  without readings is `away`'s.
+- `away` debounces by time, `away_minutes` (15), not by a count of cycles;
+  `silent_hours` (6) is the other new key, and `/api/present` uses the
+  away minutes too.
+- A fifth rule, `scanner`, always on: no cycle for 3 intervals (the test of
+  `btlog status --check`). While it is open, silent, away and range are not
+  evaluated and their episodes stay as they are, since absence cannot be
+  told from a dead scanner. `unusual` still runs: it fires on a device heard.
+- `range` counts only readings from the last `silent_hours`; one episode per
+  device and kind. The config is checked at load (kinds from
+  `decoders.UNITS`, `low <= high`); a label no device has is reported by each
+  `--run`, as only the database knows labels.
+- `unusual` also needs the device known for 7 days. Consecutive unusual hours
+  are one episode, and its close is notified like any other.
+- `notify` has three explicit forms rather than guessing from the URL: a
+  plain http(s) URL is ntfy (the text), `webhook:URL` gets the JSON,
+  `command:` the JSON on stdin. Checked at load.
+- Schema `user_version` 4. `alerts` has one row per episode: rule,
+  device_id (NULL for scanner, ON DELETE CASCADE), key (the kind for range),
+  opened, closed, message, `sent_open` and `sent_closed` (delivery times),
+  and a partial unique index allowing one open episode per alert.
+- Delivery: a failure is reported on stderr and retried on the next run; the
+  first failure ends a run's sending, so a dead target costs one timeout.
+  An episode that closed before its open notification got through is never
+  sent: it is over, and the list still has it. A target set later gets what
+  is open then, not the backlog. `--run` exits 0 even then: the table is
+  current and the next run retries.
+- A rule taken out of `alerts` loses its open episodes, without a
+  notification; they would otherwise stay open for good.
+- NixOS: `notify`, `alerts` (an enum list), `silentHours`, `awayMinutes`,
+  `range`, and the `btlog-alerts` timer, on whenever the module is. The unit
+  is ordered after `network.target`, not `network-online.target`: a box
+  without network must still keep the table for the dashboard.
+
 Roughly 350 lines with tests.
 
 ## Footfall
@@ -231,6 +269,10 @@ whether a paired phone really shows up under one address.
 
 ## Decisions
 
+- **Watching: opt-in per device, by label.** A label (`btlog name`) means
+  "this one is mine", and only labelled devices raise alerts. A stranger's
+  device never does: btlog logs who comes by, it does not keep watch on
+  other people.
 - **Default mode: `home`.** It works on day one without sensors. `sensors`
   is one line away for anyone who wants nothing about strangers stored.
 - **Notifications: an https POST (ntfy or any webhook) and `command:`.**

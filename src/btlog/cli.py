@@ -17,6 +17,7 @@ Bluetooth LE devices in proximity, and answers questions about the trends.
   btlog backup FILE                consistent copy of the database
   btlog purge                      apply retention now (the daemon does it hourly)
   btlog status [--check]           mode, database size and the last scan cycle (--check: exit 1 if stale)
+  btlog alerts [--run | --test]    open and recent alerts; --run evaluates the rules and notifies (the timer's job)
   btlog web                        read-only dashboard on http://127.0.0.1:8778 (no authentication)
   btlog daemon                     the scanner itself (runs as a service)
 
@@ -36,7 +37,7 @@ import time
 
 from datetime import date, timedelta
 
-from btlog import __version__, config as cfg, trends, vendors, when
+from btlog import __version__, config as cfg, notify, rules, trends, vendors, when
 from btlog.store import Store, public
 
 BAR = " ▁▂▃▄▅▆▇█"
@@ -277,7 +278,7 @@ def cmd_purge(store, a, conf):
 
 def cmd_status(store, a, conf):
     s = store.status()
-    stale = s["last_cycle"] is None or time.time() - s["last_cycle"] > 3 * conf.interval
+    stale = rules.stale(s["last_cycle"], conf.interval, time.time())
     size = sum(os.path.getsize(f) for f in (str(conf.db), f"{conf.db}-wal") if os.path.exists(f))
     mode = {"mode": conf.mode, "keep": conf.keep, "payloads": conf.payloads}
     emit(a, {**s, "stale": stale, "bytes": size, **mode}, "\n".join([
@@ -290,9 +291,38 @@ def cmd_status(store, a, conf):
     return 1 if a.check and stale else 0
 
 
+def cmd_alerts(store, a, conf):
+    """The list, or with --run one pass of the rules. A failed delivery is
+    reported on stderr (the journal, under the timer) and the run still
+    succeeds: the table is up to date and the next run retries."""
+    if a.run:
+        r = rules.run(store, conf)
+        for e in r["errors"]:
+            print(f"btlog: {e}", file=sys.stderr)
+        sent = f"{r['sent']} notifications sent" if conf.notify else "notifications off (no notify target)"
+        return emit(a, r, f"{r['opened']} opened, {r['closed']} closed, {r['open']} open; {sent}")
+    data = rules.listing(store)
+    lines = [table([[when.fmt(x["opened"]), x["rule"], x["message"]] for x in data["open"]],
+                   ["OPEN SINCE", "RULE", "MESSAGE"]) if data["open"] else "no open alerts"]
+    if data["closed"]:
+        lines += ["", "recently closed:",
+                  table([[when.fmt(x["opened"]), when.fmt(x["closed"]), x["rule"], x["message"]] for x in data["closed"]],
+                        ["OPENED", "CLOSED", "RULE", "MESSAGE"])]
+    emit(a, data, "\n".join(lines))
+
+
+def cmd_alerts_test(a, conf):
+    """One made-up alert to the notify target, to see it arrive on the phone."""
+    if not conf.notify:
+        raise ValueError("no notify target: set notify in the config")
+    notify.send(conf.notify, {"rule": "test", "state": "open", "device": None, "name": None,
+                              "message": "btlog test alert: notifications work", "ts": time.time()})
+    print("test alert delivered")
+
+
 def cmd_web(a, conf):
     from btlog.web import serve
-    serve(conf.db, a.bind or conf.web_bind, conf.web_names)
+    serve(conf.db, a.bind or conf.web_bind, conf.web_names, conf.away_minutes)
 
 
 def cmd_daemon(conf):
@@ -356,6 +386,9 @@ def parser():
     add("backup").add_argument("file")
     add("purge")
     add("status").add_argument("--check", action="store_true", help="exit 1 when the last cycle is older than 3 intervals")
+    al = add("alerts").add_mutually_exclusive_group()
+    al.add_argument("--run", action="store_true", help="evaluate the rules once and send pending notifications")
+    al.add_argument("--test", action="store_true", help="send one test alert to the notify target")
     add("web").add_argument("--bind", help="HOST:PORT (default from config, 127.0.0.1:8778)")
     add("daemon")
     return p
@@ -373,9 +406,12 @@ def main(argv=None):
             return cmd_daemon(conf)
         if a.cmd == "web":
             return cmd_web(a, conf)
-        writes = a.cmd in ("name", "forget", "purge")
+        if a.cmd == "alerts" and a.test:
+            return cmd_alerts_test(a, conf)
+        # alerts --run writes the alerts table only; the rest of the file it reads.
+        writes = a.cmd in ("name", "forget", "purge") or (a.cmd == "alerts" and a.run)
         with Store(conf.db, readonly=not writes) as store:
-            if a.cmd in ("purge", "status"):
+            if a.cmd in ("purge", "status", "alerts"):
                 return globals()[f"cmd_{a.cmd}"](store, a, conf)
             return globals()[f"cmd_{a.cmd}"](store, a)
     except (ValueError, LookupError, OSError, sqlite3.Error) as e:

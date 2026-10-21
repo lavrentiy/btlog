@@ -23,9 +23,10 @@ database and the same config file. Python 3.11+, one dependency
 | **Keeps raw data a while** | Raw sightings are kept `retention_days` (90 by default) for CSV export and debugging. Hourly rollups are tiny and kept forever. |
 | **Names things** | A device without a name is still shown by vendor (Apple, Garmin, Samsung...) from its manufacturer data, and you can label any device (`btlog name`). |
 | **Reads sensors** | Thermometers and the like that put their readings in their advertisements (BTHome, Ruuvi, Xiaomi on custom firmware) are decoded as they are heard: temperature, humidity, battery and more, with the same hourly rollups. See [Sensors](#sensors). |
+| **Alerts** | For the devices you labelled, and only those: a sensor gone silent, a reading out of range, your watch leaving and coming back, a device at an unusual hour, and a scanner that stopped. To ntfy, a webhook or any command (email). See [Alerts](#alerts). |
 | **Modes** | One line sets it up for a job: `home` (the default), `sensors` (nothing about strangers stored), `footfall` (rotating addresses only counted) or `record` (everything, raw payloads too, kept forever). See [Modes](#modes). |
-| **CLI** | `devices`, `show`, `hours`, `days`, `heat`, `rssi`, `readings`, `now`, `new`, `top`, `name`, `export`, `status`; bars in a terminal, `--json` for scripts. |
-| **Web** | `btlog web`: devices, presence by hour and weekday, a day-by-hour heatmap, signal and sensor readings per day, new devices on one page, standard library only. |
+| **CLI** | `devices`, `show`, `hours`, `days`, `heat`, `rssi`, `readings`, `now`, `new`, `top`, `name`, `export`, `status`, `alerts`; bars in a terminal, `--json` for scripts. |
+| **Web** | `btlog web`: devices, presence by hour and weekday, a day-by-hour heatmap, signal and sensor readings per day, new devices and open alerts on one page, standard library only. |
 
 ## Command line
 
@@ -48,6 +49,9 @@ btlog export --since 2h --json         # with the raw payloads as hex, where the
 btlog export --since 2026-10-01 --until 2026-11-01 > october.csv
 btlog backup /mnt/nas/btlog-$(date +%F).db   # consistent copy, safe while the daemon writes
 btlog status --check                   # exit 1 when the daemon has not scanned for 3 intervals
+btlog alerts                           # open alerts and the last 20 closed ones
+btlog alerts --run                     # evaluate the rules once and notify (what the timer runs)
+btlog alerts --test                    # one test notification to the notify target
 ```
 
 A device is an address, a label, an advertised name or an unambiguous prefix of
@@ -116,6 +120,69 @@ and the dashboard give the same answer after the raw rows are gone. `btlog
 now` shows each sensor's latest reading with its age, since a sensor need not
 advertise in every cycle.
 
+## Alerts
+
+`btlog alerts --run` evaluates a few rules over the database and sends one
+notification when an alert opens and one when it closes. It runs outside the
+scanner, from a timer every five minutes in the NixOS module, because the
+scanner has no network and should keep it that way.
+
+**Watching is opt-in, by label.** Only a device you labelled with `btlog name`
+can raise an alert: the label is how you say "this one is mine". A stranger's
+phone that stops coming by raises nothing, and btlog keeps no watch on other
+people's devices.
+
+| rule | opens when | closes when |
+|---|---|---|
+| `silent` | a labelled sensor (a device with readings) is not heard for `silent_hours` (6) | it is heard again |
+| `away` | any other labelled device is not heard for `away_minutes` (15): "my watch left" | it is heard again: "my watch is back" |
+| `range` | the latest reading of a kind, from the last `silent_hours`, is outside the bounds set for that label under `[range.LABEL]`; one alert per device and kind | the reading is back inside |
+| `unusual` | a labelled device is heard in an hour of day it was around less than 2 % of the time over the last 30 days (once btlog has known it a week) | it is no longer heard in an hour unusual for it |
+| `scanner` | the scanner has not run a cycle for 3 intervals (the test of `btlog status --check`) | cycles resume |
+
+`alerts` in the config picks the rules: the mode's are silent and away in
+`home`, silent and range in `sensors`; `unusual` is on only when you add it.
+`scanner` is always on. While the scanner is down, silent, away and range are
+not evaluated at all: absence cannot be told from a dead scanner, so you get
+one "scanner has not run since ..." rather than every device leaving at once.
+The away minutes are the debounce: a watch at the edge of range misses a
+cycle now and then without having left.
+
+Notifications go to `notify`, in one of three forms:
+
+- `https://ntfy.sh/btlog-7f3a9c2e` (any http or https URL): an
+  [ntfy](https://ntfy.sh) topic; the phone shows the message, titled with the rule.
+- `webhook:https://ha.local/api/webhook/btlog`: the alert as JSON, `{"rule",
+  "state": "open" or "closed", "device", "name", "message", "ts"}`, for Home
+  Assistant and the like.
+- `command:PROGRAM ARGS`: the same JSON on stdin. That is how email works,
+  with no mail password in btlog's config:
+  `command:/usr/bin/mail -s btlog me@example.org`, or msmtp.
+
+Each episode is notified once when it opens and once when it closes, never
+more. A delivery that fails is reported on stderr (the journal, under the
+timer) and tried again on the next run. An episode that closed before its
+open notification ever got through is not sent at all: it is over, and it
+stays listed in `btlog alerts`. Without `notify`, `--run` still keeps the
+table, so the dashboard shows the open alerts, and setting `notify` later
+sends what is open then, not the backlog. `btlog alerts --test` sends one test
+alert and exits 1 with the reason when it cannot.
+
+```
+$ btlog alerts
+OPEN SINCE        RULE    MESSAGE
+2026-10-21 07:42  silent  freezer not heard since 2026-10-21 01:40
+
+recently closed:
+OPENED            CLOSED            RULE  MESSAGE
+2026-10-21 08:05  2026-10-21 17:58  away  my watch left
+```
+
+Mind who can read the target: on ntfy.sh, knowing a topic's name is all it
+takes to read your alerts and to post fake ones, and on NixOS the config is
+world-readable (see [NixOS](#nixos)). Use a long random topic, or a
+self-hosted ntfy with access control.
+
 ## Web dashboard
 
 ```bash
@@ -126,10 +193,13 @@ btlog web --bind 0.0.0.0:8778      # reachable from the network
 One dark page, no frameworks: the devices on the left; for the selected device
 (or all of them) presence by hour of day and by weekday, a day-by-hour heatmap,
 signal strength per day, a chart per reading for a sensor, and the new devices
-of the last week. The same data is served as JSON under `/api/` (`status`,
-`devices`, `hours`, `days`, `timeline`, `rssi`, `readings`, `now`, `new`, each
-taking `since`, `until` and `device` where it makes sense; `readings` also
-takes `kind` and `by=day|hour`).
+of the last week; open alerts above the charts and their count in the header.
+The same data is served as JSON under `/api/` (`status`, `devices`, `hours`,
+`days`, `timeline`, `rssi`, `readings`, `now`, `new`, each taking `since`,
+`until` and `device` where it makes sense; `readings` also takes `kind` and
+`by=day|hour`), plus `alerts` (open and the last 20 closed, as
+`btlog --json alerts`) and `present` (labelled devices heard within
+`away_minutes`, for Home Assistant or a script).
 
 The dashboard opens the database read-only and never writes. Device names come
 from strangers' advertisements, so the page escapes everything before it goes
@@ -176,8 +246,8 @@ same as with `all` (its readings, meaningless once anonymous, are dropped).
 data field, the last ones heard per device and cycle, so evidence does not
 depend on what the decoders understood and a decoder written later can be run
 over old data; `btlog export --json` gives them as hex, and they roughly
-double the database. `alerts` names the alert rules for `btlog alerts`, which
-is still to come (see docs/roadmap.md); nothing reads it yet.
+double the database. `alerts` names the rules `btlog alerts --run` evaluates;
+see [Alerts](#alerts).
 
 What a mode means for other people's devices:
 
@@ -220,10 +290,22 @@ retention_days = 365             # overrides the mode's 90; 0 keeps raw rows for
 # forget_random_days = 7         # the mode's; rotating private addresses, 0 never forgets
 # keep = "sensors"               # the mode's: all, sensors or counts
 # payloads = false               # the mode's; true stores the raw advertisement bytes too
-# alerts = ["silent", "range"]   # the mode's rule names; nothing reads them yet
+# alerts = ["silent", "range"]   # the mode's rules; add "unusual" to have it
+notify = "https://ntfy.sh/btlog-7f3a9c2e"  # or webhook:URL or command:PROGRAM ARGS; default: none
+silent_hours = 6                 # a labelled sensor unheard this long is silent
+away_minutes = 15                # a labelled device unheard this long has left
 web_bind = "127.0.0.1:8778"
 web_names = []                   # extra Host names, e.g. ["bench.tailnet-1234.ts.net"]
+
+[range.freezer]                  # bounds per device label, for the range rule
+temperature = [-30, -15]
+battery = [20, 100]
 ```
+
+The config is checked when it is loaded: an unknown rule, a `notify` in none
+of the three forms, or a range with an unknown kind or `low > high` stops
+btlog with a one-line error. A range label that no device has is reported by
+every `btlog alerts --run`, as only the database knows the labels.
 
 `btlog status` shows the mode in effect.
 
@@ -240,12 +322,14 @@ SQLite, WAL mode so the CLI and the dashboard read while the daemon writes.
 | `readings` | sensor, kind and scan cycle: the value heard | `retention_days` |
 | `hourly_readings` | sensor, kind and local hour: count, min, max and sum | forever |
 | `payloads` | device, scan cycle and field (`m:004C` company id, `s:` + service UUID): the raw bytes, with `payloads = true` only | `retention_days` |
+| `alerts` | alert episode: rule, device (none for `scanner`), kind for `range`, opened, closed, message, and when the open and the close notification were delivered | forever; a device's go when it is forgotten |
 
 Hours are local time, because "who is here at eight in the morning" is a local
 question. `PRAGMA user_version` is the schema version (2 since readings, 3
-since raw payloads); the daemon migrates the file when it starts, and a
-dashboard or CLI that meets an older file shows no readings or payloads until
-then. Privacy: the database is readable by the `btlog` user only
+since raw payloads, 4 since alerts); the daemon (or `btlog alerts --run`)
+migrates the file when it starts, and a dashboard or CLI that meets an older
+file shows no readings, payloads or alerts until then. `btlog alerts --run`
+writes the alerts table and nothing else. Privacy: the database is readable by the `btlog` user only
 (`/var/lib/btlog`, mode 0750); `forget_random_days` bounds how long a rotating
 address is kept; `btlog forget` removes one device, `btlog export` takes data
 out, and deleting the database file starts over. Advertised names are stored
@@ -267,13 +351,29 @@ btlog.nixosModules.default
     interval = 60;
     # retentionDays = 365;   # left unset: the mode's 90
     web.enable = true;       # dashboard on http://127.0.0.1:8778, no authentication
+    notify = "https://ntfy.sh/btlog-7f3a9c2e";   # readable by anyone on the box, see below
+    range.freezer.temperature = [ (-30) (-15) ];
   };
 }
 ```
 
-`retentionDays`, `forgetRandomDays` and `payloads` default to `null`, which
-leaves them to the mode; set one and it wins over the mode, as in the config
-file.
+`retentionDays`, `forgetRandomDays`, `payloads`, `alerts`, `silentHours` and
+`awayMinutes` default to `null`, which leaves them to the mode (or btlog's
+default); set one and it wins over the mode, as in the config file. `range` is
+written only when set; `notify` defaults to none.
+
+Alerts run from the `btlog-alerts` timer: `btlog alerts --run` five minutes
+after boot and every five minutes after that, as the `btlog` user, in a
+oneshot unit of its own with the same hardening as the scanner's but network
+access; the scanner keeps `PrivateNetwork`. The timer is on whenever the
+module is, `notify` or not, as the alerts table feeds the dashboard.
+**`notify` lands in the world-readable Nix store and in `/etc/btlog.toml`**:
+anyone with a shell on the machine can read it, and an ntfy.sh topic is all
+it takes to read your alerts or post fake ones. Use a long random topic, or a
+self-hosted ntfy with access control reached through a `command:` whose
+script reads its token from a file only the btlog user can read. That unit
+has no new privileges, so a mailer that needs a setgid helper (Postfix's
+`sendmail`) fails from it; msmtp works.
 
 The module enables `hardware.bluetooth` and runs the scanner as its own `btlog`
 user with a hardened systemd unit that has no network at all (`PrivateNetwork`),
@@ -312,5 +412,6 @@ nix build                                     # builds and runs the tests
 The tests need no Bluetooth hardware and do not import bleak: the daemon loop
 runs against a scripted scanner source (cycles, an empty cycle, a failing scan),
 the store and the trend queries against in-memory databases with days of
-synthetic sightings, the CLI through `main()`, and the dashboard served on a
-free port from a temporary database.
+synthetic sightings, the CLI through `main()`, the dashboard served on a
+free port from a temporary database, the alert rules over scripted cycles at
+a chosen time, and notifications against a local HTTP server.

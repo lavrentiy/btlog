@@ -7,6 +7,8 @@
 #     retentionDays = 365;       # raw rows; 0 = forever (hourly rollups always are); null = the mode's
 #     forgetRandomDays = 7;      # drop rotating private addresses unseen this long; 0 = never; null = the mode's
 #     web.enable = true;         # read-only dashboard on http://127.0.0.1:8778
+#     notify = "https://ntfy.sh/btlog-7f3a9c";   # alerts to a phone; see the option's warning
+#     range.freezer.temperature = [ (-30) (-15) ];
 #   };
 #
 # Only options that are set land in /etc/btlog.toml next to the mode: a key
@@ -20,6 +22,11 @@
 #
 # The dashboard has no authentication: leave web.bind on localhost and reach
 # it over an SSH port forward or Tailscale, or bind it to a trusted network.
+#
+# Alerts run from the btlog-alerts timer every five minutes, as their own unit
+# with network access, so the scanner keeps PrivateNetwork. The timer is on
+# whenever the module is: the alerts table feeds the dashboard even with no
+# notify target.
 
 { config, lib, pkgs, ... }:
 
@@ -37,6 +44,12 @@ let
     retention_days = cfg.retentionDays;
     forget_random_days = cfg.forgetRandomDays;
     payloads = cfg.payloads;
+    notify = cfg.notify;
+    alerts = cfg.alerts;
+    silent_hours = cfg.silentHours;
+    away_minutes = cfg.awayMinutes;
+  } // lib.optionalAttrs (cfg.range != { }) {
+    range = cfg.range;
   });
   hardening = {
     NoNewPrivileges = true;
@@ -152,6 +165,69 @@ in
       '';
     };
 
+    notify = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      example = "https://ntfy.sh/btlog-7f3a9c2e";
+      description = ''
+        Where alerts are sent: an ntfy topic URL (the message as text), a
+        `webhook:URL` (the alert as JSON), or `command:PROGRAM ARGS` (the alert
+        as JSON on stdin; email works this way). null sends nothing; the alerts
+        are still kept for the dashboard and `btlog alerts`.
+
+        Warning: the value lands in the world-readable Nix store and in
+        /etc/btlog.toml. Anyone on the machine can read it, and on ntfy.sh
+        knowing a topic is all it takes to read it and post to it. Use a long
+        unguessable topic, or a self-hosted ntfy with access control reached
+        through a command, e.g. `command:/var/lib/btlog/notify` running a
+        script that reads its token from a file only the btlog user can read.
+      '';
+    };
+
+    alerts = lib.mkOption {
+      type = lib.types.nullOr (lib.types.listOf (lib.types.enum [ "silent" "away" "range" "unusual" ]));
+      default = null;
+      example = [ "silent" "away" "unusual" ];
+      description = ''
+        The alert rules to evaluate. Only labelled devices (`btlog name`) are
+        watched. silent: a sensor not heard for silentHours. away: any other
+        device not heard for awayMinutes ("left", then "is back"). range: a
+        reading outside the bounds in `range`. unusual: a device heard in an
+        hour of day it is around less than 2 % of the time. The scanner alert
+        (no scan cycle for 3 intervals) is always on. null: the mode's
+        (silent and away in home, silent and range in sensors, none otherwise).
+      '';
+    };
+
+    silentHours = lib.mkOption {
+      type = lib.types.nullOr lib.types.numbers.positive;
+      default = null;
+      example = 2;
+      description = "Hours a labelled sensor may go unheard before it is silent. null: 6.";
+    };
+
+    awayMinutes = lib.mkOption {
+      type = lib.types.nullOr lib.types.numbers.positive;
+      default = null;
+      example = 30;
+      description = ''
+        Minutes a labelled device may go unheard before it has left, and the
+        window of /api/present. It is the debounce: a weak signal that misses
+        a few cycles does not flap. null: 15.
+      '';
+    };
+
+    range = lib.mkOption {
+      type = lib.types.attrsOf (lib.types.attrsOf (lib.types.listOf lib.types.number));
+      default = { };
+      example = lib.literalExpression ''{ freezer = { temperature = [ (-30) (-15) ]; battery = [ 20 100 ]; }; }'';
+      description = ''
+        Bounds per device label and reading kind, [ low high ], for the range
+        rule. Kinds: temperature, humidity, pressure, battery, voltage,
+        illuminance, moisture, co2; btlog checks them when it starts.
+      '';
+    };
+
     stateDir = lib.mkOption {
       type = lib.types.path;
       default = "/var/lib/btlog";
@@ -248,6 +324,33 @@ in
         StateDirectoryMode = "0750";   # systemd re-applies the mode on every start
         ReadWritePaths = [ cfg.stateDir ];
         RestrictAddressFamilies = [ "AF_INET" "AF_INET6" "AF_UNIX" ];
+      };
+    };
+
+    # The rules, and the notifications they send, run outside the scanner: it
+    # has no network, and this needs some. Writes the alerts table only, in
+    # short transactions, so the daemon is not held up.
+    systemd.services.btlog-alerts = {
+      description = "btlog alert rules and notifications";
+      after = [ "network.target" "btlog.service" ];
+      serviceConfig = hardening // {
+        Type = "oneshot";
+        ExecStart = "${lib.getExe cfg.package} alerts --run";
+        User = "btlog";
+        Group = "btlog";
+        StateDirectory = stateDirectory;
+        StateDirectoryMode = "0750";
+        ReadWritePaths = [ cfg.stateDir ];
+        RestrictAddressFamilies = [ "AF_INET" "AF_INET6" "AF_UNIX" ];
+      };
+    };
+
+    systemd.timers.btlog-alerts = {
+      description = "Evaluate btlog alert rules every five minutes";
+      wantedBy = [ "timers.target" ];
+      timerConfig = {
+        OnBootSec = "5min";
+        OnUnitActiveSec = "5min";
       };
     };
   };

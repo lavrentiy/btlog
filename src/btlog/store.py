@@ -18,6 +18,10 @@
              evidence does not depend on what the decoders understood and a
              decoder written later can be run over old data. Deleted after
              retention_days.
+  alerts     one row per alert episode of `btlog alerts`: the rule, the device
+             (none for the scanner's own), when it opened and closed, and when
+             its open and its close notification were delivered. Written by
+             `btlog alerts --run` only, never by the daemon.
 
 Hours are local time, because "who is here at eight in the morning" is a local
 question; day and weekday are stored alongside so GROUP BY stays in SQL.
@@ -29,10 +33,10 @@ rows are folded into a single "forgotten" pseudo-device first, so the count of
 devices around per hour stays right after the address is gone.
 
 PRAGMA user_version says which tables exist: 1 (or 0, never set) is the schema
-without readings, 2 adds them, 3 adds payloads. A writable Store migrates
-forward on open; a read-only one on an older file (the dashboard upgraded
-before the daemon was restarted) answers the reading and payload queries with
-nothing rather than failing.
+without readings, 2 adds them, 3 adds payloads, 4 adds alerts. A writable
+Store migrates forward on open; a read-only one on an older file (the
+dashboard upgraded before the daemon was restarted) answers the reading,
+payload and alert queries with nothing rather than failing.
 """
 
 import os
@@ -107,8 +111,21 @@ CREATE TABLE IF NOT EXISTS payloads (
     data BLOB NOT NULL,             -- the last bytes heard in the cycle
     PRIMARY KEY (device_id, ts, field)
 ) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS alerts (
+    id INTEGER PRIMARY KEY,
+    rule TEXT NOT NULL,             -- silent, away, range, unusual or scanner
+    device_id INTEGER REFERENCES devices(id) ON DELETE CASCADE,  -- NULL for scanner
+    key TEXT NOT NULL,              -- the kind for range, '' otherwise
+    opened REAL NOT NULL,
+    closed REAL,                    -- NULL while open
+    message TEXT NOT NULL,          -- what the open notification says
+    sent_open REAL,                 -- when the open notification was delivered; NULL: not (yet)
+    sent_closed REAL                -- the same for the close notification
+);
+-- At most one open episode per alert, whatever two runs at once might do.
+CREATE UNIQUE INDEX IF NOT EXISTS alerts_open ON alerts(rule, IFNULL(device_id, 0), key) WHERE closed IS NULL;
 """
-VERSION = 3   # PRAGMA user_version of SCHEMA; see the module docstring
+VERSION = 4   # PRAGMA user_version of SCHEMA; see the module docstring
 
 PRIVATE_KINDS = ("rpa", "nrpa")
 FORGOTTEN = "forgotten"
@@ -215,7 +232,7 @@ class Store:
         # Read once: a reader lives for one command or one request, and the
         # tables it may query do not change under it.
         version = self.conn.execute("PRAGMA user_version").fetchone()[0]
-        self.has_readings, self.has_payloads = version >= 2, version >= 3
+        self.has_readings, self.has_payloads, self.has_alerts = version >= 2, version >= 3, version >= 4
         self.conn.row_factory = _row
         self.conn.execute("PRAGMA foreign_keys=ON")
         self.conn.create_function("fold", 1, _fold, deterministic=True)

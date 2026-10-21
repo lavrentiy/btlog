@@ -2,8 +2,8 @@
 
 One page: the devices on the left, and for the selected one (or all of them)
 presence by hour of day and by weekday, a day-by-hour heatmap, signal strength
-and sensor readings per day, and the new devices of the week. The same data is
-served as JSON under /api/. Device names come from strangers' advertisements,
+and sensor readings per day, and the new devices of the week; open alerts on
+top. The same data is served as JSON under /api/. Device names come from strangers' advertisements,
 so the page escapes everything it puts into HTML.
 
 The server opens the database read-only, once per request: SQLite connections
@@ -21,7 +21,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 
-from btlog import trends, when
+from btlog import rules, trends, when
 from btlog.store import Store, public
 
 log = logging.getLogger("btlog")
@@ -33,7 +33,7 @@ PAGE ="""<!doctype html>
   :root { color-scheme: dark; --bg: #14171c; --fg: #d8dce3; --dim: #7d8590; --bar: #4c9be8; --sel: #263040; --line: #2a303a; }
   body { margin: 0; background: var(--bg); color: var(--fg); font: 14px/1.4 system-ui, sans-serif; }
   header { padding: 10px 16px; border-bottom: 1px solid var(--line); display: flex; gap: 16px; align-items: baseline; flex-wrap: wrap; }
-  header b { font-size: 16px; } header span { color: var(--dim); }
+  header b { font-size: 16px; } header span { color: var(--dim); } header span.warn, .warn { color: #e8a14c; } #alerts { margin-bottom: 14px; }
   main { display: grid; grid-template-columns: minmax(280px, 1fr) 2fr; gap: 0; min-height: calc(100vh - 44px); }
   @media (max-width: 800px) { main { grid-template-columns: 1fr; } }
   #list { border-right: 1px solid var(--line); overflow: auto; max-height: calc(100vh - 44px); }
@@ -54,11 +54,12 @@ PAGE ="""<!doctype html>
   .heat i.none { background: var(--line); opacity: 1; }
   .heat span { text-align: center; }
 </style>
-<header><b>btlog</b><span id="status">loading</span>
+<header><b>btlog</b><span id="status">loading</span><span id="alertcount" class="warn" hidden></span>
   <label>since <input id="since" value="30d" size="8"></label></header>
 <main>
   <div id="list"></div>
   <section>
+    <div id="alerts" hidden></div>
     <div id="title">All devices</div>
     <h2 id="hourstitle">Presence by hour of day</h2><div class="chart" id="hours"></div><div class="labels" id="hourlabels"></div>
     <h2>By weekday</h2><div class="chart" id="days"></div><div class="labels" id="daylabels"></div>
@@ -145,6 +146,11 @@ async function devices() {
   const all = `<div class="${selected ? '' : 'sel'}" data-a="">All devices<small>average per scan cycle</small></div>`;
   $('#list').innerHTML = all + list.map(d => `<div class="${selected === d.address ? 'sel' : ''}" data-a="${esc(d.address)}" data-t="${esc(d.address)} ${name(d)}">
     <span class="mono">${esc(d.address)}</span> ${name(d)}<small>${esc(d.kind)}${d.vendor ? ', ' + esc(d.vendor) : ''}, ${d.hours} h, last ${new Date(d.last_seen * 1000).toLocaleString()}</small></div>`).join('');
+  // Alert messages carry labels and values: escaped like everything else.
+  const al = (await api('/api/alerts', {})).open;
+  $('#alertcount').hidden = $('#alerts').hidden = !al.length;
+  $('#alertcount').textContent = al.length === 1 ? '1 open alert' : `${al.length} open alerts`;
+  $('#alerts').innerHTML = '<h2>Open alerts</h2><table>' + al.map(x => `<tr><td class="dim">${esc(new Date(x.opened * 1000).toLocaleString())}</td><td>${esc(x.rule)}</td><td class="warn">${esc(x.message)}</td></tr>`).join('') + '</table>';
   const fresh = await api('/api/new', { since: '7d' });
   $('#new').innerHTML = fresh.length ? '<table>' + fresh.map(d => `<tr><td>${esc(d.address)}</td><td>${name(d)}</td><td class="dim">${new Date(d.first_seen * 1000).toLocaleString()}</td></tr>`).join('') + '</table>' : '<span class="dim">none</span>';
 }
@@ -165,6 +171,7 @@ setInterval(refresh, 60000);
 
 class Handler(BaseHTTPRequestHandler):
     db = None
+    away_minutes = 15    # what /api/present calls present: the away rule's minutes
     names = frozenset()  # see host_names()
     server_version = "btlog"
     timeout = 10  # a client that connects and says nothing does not pin a thread
@@ -229,6 +236,10 @@ class Handler(BaseHTTPRequestHandler):
             return trends.readings(store, did, q.get("kind") or None, since, until, by=q.get("by", "day"))
         if path == "/api/now":
             return store.now()
+        if path == "/api/alerts":
+            return rules.listing(store)
+        if path == "/api/present":
+            return rules.present(store, self.away_minutes)
         if path == "/api/new":
             if since is None:
                 raise ValueError("since required")
@@ -266,16 +277,16 @@ def host_names(bind_host, extra=()):
     return frozenset(n.lower().rstrip(".") for n in names if n)
 
 
-def make_server(db, bind, names=()):
+def make_server(db, bind, names=(), away_minutes=15):
     host, _, port = bind.rpartition(":")
     if not host or not port.isdigit():
         raise ValueError(f"bind must be HOST:PORT, not {bind!r}")
-    handler = type("Handler", (Handler,), {"db": db, "names": host_names(host, names)})
+    handler = type("Handler", (Handler,), {"db": db, "names": host_names(host, names), "away_minutes": away_minutes})
     return ThreadingHTTPServer((host, int(port)), handler)
 
 
-def serve(db, bind, names=()):
-    srv = make_server(db, bind, names)
+def serve(db, bind, names=(), away_minutes=15):
+    srv = make_server(db, bind, names, away_minutes)
     print(f"btlog web on http://{srv.server_address[0]}:{srv.server_address[1]} (read-only, no authentication)")
     try:
         srv.serve_forever()

@@ -253,7 +253,7 @@ class ConfigTest(unittest.TestCase):
         self.assertEqual((c.interval, c.retention_days, c.forget_random_days), (60, 90, 7))
         with tempfile.TemporaryDirectory() as tmp:
             p = Path(tmp) / "btlog.toml"
-            p.write_text('db = "~/x/btlog.db"\ninterval = 30\nadapter = "hci1"\n', encoding="utf-8")
+            p.write_text('db = "~/x/btlog.db"\ninterval = 30\nadapter = "hci1"\n', encoding="utf-8-sig")  # with a BOM
             c = config.load(p)
             self.assertEqual((c.db, c.interval, c.adapter), (Path("~/x/btlog.db").expanduser(), 30, "hci1"))
             p.write_text("intervall = 30\n", encoding="utf-8")
