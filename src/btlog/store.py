@@ -205,9 +205,12 @@ class Store:
             raise LookupError(f"no device {address}")
 
     def purge(self, now, retention_days, forget_random_days):
-        """Apply retention; returns (sightings deleted, random devices forgotten)."""
-        old = now - retention_days * 86400
-        unseen = now - forget_random_days * 86400
+        """Apply retention; returns (sightings deleted, random devices forgotten).
+        0 for either means keep forever: that is the "log everything" setting,
+        so it must be an explicit no-op rather than "older than now"."""
+        # -1 as the cutoff matches nothing: timestamps are never negative here.
+        old = now - retention_days * 86400 if retention_days else -1
+        unseen = now - forget_random_days * 86400 if forget_random_days else -1
         with self.conn:
             sightings = self.conn.execute("DELETE FROM sightings WHERE ts < ?", (old,)).rowcount
             stale = ("kind IN (?, ?) AND last_seen < ?", (*PRIVATE_KINDS, unseen))

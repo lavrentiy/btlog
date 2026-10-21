@@ -160,6 +160,13 @@ class PurgeTest(unittest.TestCase):
             "SELECT day, cycles, rssi_max FROM hourly WHERE device_id = ? AND hour = 8 ORDER BY day", (f["id"],)).fetchall()
         self.assertEqual([tuple(r.values()) for r in folded], [("2026-10-01", 2, -60), ("2026-10-21", 1, -40)])
 
+    def test_zero_means_keep_forever(self):
+        self.assertEqual(self.store.purge(at(30, 12), retention_days=0, forget_random_days=0), (0, 0))
+        self.assertEqual(self.store.status()["sightings"], 6)
+        self.assertEqual(len(self.store.devices(private=True)), 3)
+        self.assertEqual(self.store.purge(at(30, 12), retention_days=0, forget_random_days=7), (0, 2))
+        self.assertEqual(self.store.status()["sightings"], 3)
+
     def test_recently_seen_private_address_survives(self):
         self.store.record_cycle(at(20, 9), adverts((PHONE, -60)))
         self.assertEqual(self.store.purge(at(20, 12), 365, 7), (0, 1))

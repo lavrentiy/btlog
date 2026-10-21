@@ -170,8 +170,10 @@ class ConfigTest(unittest.TestCase):
             p.write_text("intervall = 30\n", encoding="utf-8")
             with self.assertRaisesRegex(ValueError, "intervall"):
                 config.load(p)
-            for bad in ('interval = 0\n', 'interval = "60"\n', 'retention_days = 1.5\n', 'adapter = 1\n',
-                        'forget_random_days = true\n'):
+            p.write_text("retention_days = 0\nforget_random_days = 0\n", encoding="utf-8")
+            self.assertEqual((config.load(p).retention_days, config.load(p).forget_random_days), (0, 0))
+            for bad in ('interval = 0\n', 'interval = "60"\n', 'retention_days = 1.5\n', 'retention_days = -1\n',
+                        'adapter = 1\n', 'forget_random_days = true\n'):
                 p.write_text(bad, encoding="utf-8")
                 with self.assertRaises(ValueError, msg=bad):
                     config.load(p)

@@ -203,8 +203,9 @@ def cmd_export(store, a):
 
 def cmd_purge(store, a, conf):
     sightings, devices = store.purge(time.time(), conf.retention_days, conf.forget_random_days)
-    print(f"deleted {sightings} sightings older than {conf.retention_days} days, "
-          f"forgot {devices} private addresses unseen for {conf.forget_random_days} days")
+    kept = lambda days: f"{days} days" if days else "ever (kept forever)"  # noqa: E731
+    print(f"deleted {sightings} sightings older than {kept(conf.retention_days)}, "
+          f"forgot {devices} private addresses unseen for {kept(conf.forget_random_days)}")
 
 
 def cmd_status(store, a, conf):

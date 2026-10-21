@@ -23,8 +23,8 @@ class Config:
     db: Path = field(default_factory=_default_db)
     interval: float = 60.0        # seconds per scan cycle: one sighting per device per cycle
     adapter: str | None = None    # "hci0"; None picks the default adapter
-    retention_days: int = 90      # raw sightings; hourly rollups are kept forever
-    forget_random_days: int = 7   # private random addresses unseen this long are removed
+    retention_days: int = 90      # raw sightings; 0 keeps them forever (rollups always are)
+    forget_random_days: int = 7   # private random addresses unseen this long are removed; 0 never
     web_bind: str = "127.0.0.1:8778"
 
 
@@ -47,7 +47,7 @@ def load(path=None):
                        "adapter": (str, type(None)), "web_bind": (str,), "db": (str,)}.items():
         if key in data and (not isinstance(data[key], kinds) or isinstance(data[key], bool)):
             raise ValueError(f"config key {key} must be {' or '.join(k.__name__ for k in kinds)}")
-        if key in data and kinds[0] in (int, float) and data[key] <= 0:
+        if key in data and kinds[0] in (int, float) and data[key] < (0 if key.endswith("_days") else 1e-9):
             raise ValueError(f"config key {key} must be positive")
     if "db" in data:
         data["db"] = Path(data["db"]).expanduser()

@@ -3,8 +3,8 @@
 #   services.btlog = {
 #     enable = true;
 #     interval = 60;             # seconds per scan cycle
-#     retentionDays = 90;        # raw sightings; hourly rollups are kept forever
-#     forgetRandomDays = 7;      # drop rotating private addresses unseen this long
+#     retentionDays = 90;        # raw sightings; 0 = forever (hourly rollups always are)
+#     forgetRandomDays = 7;      # drop rotating private addresses unseen this long; 0 = never
 #     web.enable = true;         # read-only dashboard on http://127.0.0.1:8778
 #   };
 #
@@ -79,17 +79,18 @@ in
     };
 
     retentionDays = lib.mkOption {
-      type = lib.types.ints.positive;
+      type = lib.types.ints.unsigned;
       default = 90;
-      description = "How long raw sightings are kept. Hourly rollups are kept forever.";
+      description = "How long raw sightings are kept; 0 keeps them forever. Hourly rollups are kept forever.";
     };
 
     forgetRandomDays = lib.mkOption {
-      type = lib.types.ints.positive;
+      type = lib.types.ints.unsigned;
       default = 7;
       description = ''
         Rotating private addresses not seen for this many days are removed from
         the database, keeping only their contribution to the per-hour counts.
+        0 never removes them.
       '';
     };
 

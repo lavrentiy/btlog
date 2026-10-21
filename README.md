@@ -105,8 +105,8 @@ network only.
 db = "/var/lib/btlog/btlog.db"   # default ~/.local/state/btlog/btlog.db
 interval = 60                    # seconds per scan cycle
 adapter = "hci0"                 # default: the default adapter
-retention_days = 90              # raw sightings
-forget_random_days = 7           # rotating private addresses
+retention_days = 90              # raw sightings; 0 keeps them forever
+forget_random_days = 7           # rotating private addresses; 0 never forgets
 web_bind = "127.0.0.1:8778"
 ```
 
@@ -127,6 +127,25 @@ question. Privacy: the database is readable by the `btlog` user only
 address is kept; `btlog forget` removes one device, `btlog export` takes data
 out, and deleting the database file starts over. Advertised names are stored
 with control characters stripped, so a hostile name cannot drive your terminal.
+
+### Keeping everything
+
+The defaults are for watching your own place: raw data ages out, rotating
+addresses are forgotten. Both knobs accept `0` for "never":
+
+```toml
+retention_days = 0        # keep every raw sighting
+forget_random_days = 0    # never remove rotating private addresses
+```
+
+That is the whole change for a shop that wants a log to hand over after a
+break-in, with `btlog export --since 2026-10-17 --json` as the output and
+`sha256sum` on the file as the seal. Know what you are getting: a rotating
+address still cannot be tied to a person without that person's device, a
+signal strength does not say inside or outside, and logging the devices of
+everyone who walks past is processing their personal data, which in the EU
+needs a legal basis, a retention limit and a notice, as CCTV does. btlog gives
+you the log; the rest is yours.
 
 ## NixOS
 
